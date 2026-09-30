@@ -1,9 +1,13 @@
 #include "aes67/alsa_sink.hpp"
+#include "aes67/audio_packet.hpp"
+#include "aes67/playout_controller.hpp"
+#include "aes67/ptp_clock.hpp"
 #include "aes67/receive_path.hpp"
 #include "aes67/sdp_session.hpp"
 #include "aes67/udp_receiver.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -12,6 +16,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -26,7 +31,7 @@ void print_usage(const char* executable) {
     std::cout << "Usage: " << executable
               << " [--sdp FILE | [--bind ADDRESS] [--port PORT] [--multicast ADDRESS] [--interface ADDRESS]"
               << " [--payload-type TYPE]"
-              << "] [--first-timestamp TIMESTAMP] [--device ALSA_DEVICE]\n";
+              << "] [--first-timestamp TIMESTAMP] [--playout-delay-ms MS] [--device ALSA_DEVICE]\n";
 }
 
 std::uint32_t parse_unsigned(const std::string& value, const char* option,
@@ -66,6 +71,7 @@ int main(int argc, char** argv) {
     std::string multicast_interface = "0.0.0.0";
     std::uint8_t payload_type = 96;
     std::optional<std::uint32_t> first_timestamp;
+    std::uint32_t playout_delay_ms = 20;
     std::string sdp_path;
     bool manual_network_options = false;
     std::string alsa_device = "default";
@@ -100,6 +106,8 @@ int main(int argc, char** argv) {
                 manual_network_options = true;
             } else if (option == "--first-timestamp") {
                 first_timestamp = parse_unsigned(value, "--first-timestamp", std::numeric_limits<std::uint32_t>::max());
+            } else if (option == "--playout-delay-ms") {
+                playout_delay_ms = parse_unsigned(value, "--playout-delay-ms", 10'000);
             } else if (option == "--device") {
                 alsa_device = value;
             } else {
@@ -139,13 +147,32 @@ int main(int argc, char** argv) {
         aes67::UdpReceiver receiver(aes67::UdpReceiverConfig{
             port, bind_address, multicast_group, multicast_interface, true});
         aes67::AlsaSink sink(alsa_device);
+        aes67::PtpClock ptp_clock;
+        aes67::PlayoutController playout({aes67::AudioFormat::sample_rate, aes67::AudioFormat::samples_per_packet,
+                          playout_delay_ms, std::max<std::size_t>(1, playout_delay_ms), sdp.has_value()});
 
         std::cout << "Listening on " << bind_address << ":" << port
                   << (multicast_group.empty() ? "" : " (multicast " + multicast_group + ")")
               << ", writing L24 to ALSA device " << alsa_device << "\n";
         while (running) {
-            receiver.receive_once(path);
-            while (path.render_next(sink)) {
+            if (receiver.receive_once(path)) {
+                if (const auto timestamp = path.last_timestamp(); timestamp.has_value()) {
+                    playout.observe_packet(*timestamp, ptp_clock.now_ns());
+                }
+            }
+            const auto next_timestamp = path.next_timestamp();
+            const auto now_ptp_time_ns = ptp_clock.now_ns();
+            if (!next_timestamp.has_value() || !playout.mapped() ||
+                now_ptp_time_ns < playout.due_time_ns(*next_timestamp, now_ptp_time_ns)) {
+                if (next_timestamp.has_value() && playout.mapped() && path.buffered_packets() > 0) {
+                    const auto deadline = playout.due_time_ns(*next_timestamp, now_ptp_time_ns);
+                    if (deadline > now_ptp_time_ns) ptp_clock.sleep_until_ns(deadline);
+                }
+                continue;
+            }
+            if (const auto packet = path.take_next(); packet.has_value()) {
+                const auto output_samples = playout.output_samples(path.buffered_packets() + 1);
+                sink.write(aes67::resample_linear(*packet, output_samples));
             }
         }
     } catch (const std::exception& error) {

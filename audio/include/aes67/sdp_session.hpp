@@ -18,6 +18,8 @@ struct SdpSession {
     std::string encoding_name = "L24";
     std::uint32_t clock_rate = 48000;
     std::uint8_t channels = 2;
+    bool ptp_reference_clock = false;
+    bool direct_media_clock = false;
 
     static SdpSession parse(std::string_view text);
     std::string generate() const;

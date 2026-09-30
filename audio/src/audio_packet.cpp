@@ -1,5 +1,6 @@
 #include "aes67/audio_packet.hpp"
 
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -68,6 +69,35 @@ AudioPacket decode_l24(const AudioFormat& format, std::uint32_t rtp_timestamp,
         packet.samples.push_back(read_sample(payload.data() + offset));
     }
     return packet;
+}
+
+AudioPacket resample_linear(const AudioPacket& packet, std::size_t output_samples_per_channel) {
+    validate_format(packet.format);
+    const auto input_samples_per_channel = packet.samples.size() / packet.format.channels;
+    if (input_samples_per_channel == 0 || packet.samples.size() % packet.format.channels != 0 ||
+        output_samples_per_channel == 0) {
+        throw std::invalid_argument("cannot resample an empty or malformed audio packet");
+    }
+    if (input_samples_per_channel == output_samples_per_channel) return packet;
+
+    AudioPacket result{packet.format, packet.rtp_timestamp, {}};
+    result.samples.resize(output_samples_per_channel * packet.format.channels);
+    for (std::size_t frame = 0; frame < output_samples_per_channel; ++frame) {
+        const auto position = output_samples_per_channel == 1
+                                  ? 0.0
+                                  : static_cast<double>(frame) * (input_samples_per_channel - 1) /
+                                        (output_samples_per_channel - 1);
+        const auto left = static_cast<std::size_t>(position);
+        const auto right = std::min(left + 1, input_samples_per_channel - 1);
+        const auto fraction = position - static_cast<double>(left);
+        for (std::size_t channel = 0; channel < packet.format.channels; ++channel) {
+            const auto first = packet.samples[left * packet.format.channels + channel];
+            const auto second = packet.samples[right * packet.format.channels + channel];
+            result.samples[frame * packet.format.channels + channel] = static_cast<std::int32_t>(
+                std::llround(static_cast<double>(first) + (static_cast<double>(second - first) * fraction)));
+        }
+    }
+    return result;
 }
 
 }  // namespace aes67

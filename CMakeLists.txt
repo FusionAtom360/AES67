@@ -8,6 +8,8 @@ add_library(aes67_audio
     audio/src/audio_packet.cpp
     audio/src/alsa_sink.cpp
     audio/src/jitter_buffer.cpp
+    audio/src/ptp_clock.cpp
+    audio/src/playout_controller.cpp
     audio/src/receive_path.cpp
     audio/src/rtp_packet.cpp
     audio/src/sdp_session.cpp

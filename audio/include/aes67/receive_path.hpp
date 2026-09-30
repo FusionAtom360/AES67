@@ -4,6 +4,7 @@
 #include "aes67/jitter_buffer.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace aes67 {
@@ -21,6 +22,9 @@ public:
     // Write the next timestamp-contiguous packet. Returns false while waiting
     // for the next packet in sequence.
     bool render_next(AlsaSink& sink);
+    std::optional<AudioPacket> take_next();
+    std::optional<std::uint32_t> next_timestamp() const noexcept;
+    std::optional<std::uint32_t> last_timestamp() const noexcept;
     std::size_t buffered_packets() const noexcept;
 
 private:
@@ -28,6 +32,7 @@ private:
     std::uint8_t payload_type_;
     JitterBuffer jitter_buffer_;
     bool primed_ = false;
+    std::optional<std::uint32_t> last_timestamp_;
 };
 
 }  // namespace aes67

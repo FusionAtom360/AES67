@@ -29,4 +29,7 @@ std::vector<std::uint8_t> encode_l24(const AudioPacket& packet);
 AudioPacket decode_l24(const AudioFormat& format, std::uint32_t rtp_timestamp,
                        std::span<const std::uint8_t> payload);
 
+// Resample one interleaved packet to a new number of samples per channel.
+AudioPacket resample_linear(const AudioPacket& packet, std::size_t output_samples_per_channel);
+
 }  // namespace aes67

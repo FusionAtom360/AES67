@@ -13,6 +13,7 @@ ReceivePath::ReceivePath(AudioFormat format, std::uint8_t payload_type,
 
 bool ReceivePath::ingest(std::span<const std::uint8_t> datagram) {
     const auto rtp = parse_rtp(datagram);
+    last_timestamp_ = rtp.timestamp;
     if (rtp.payload_type != payload_type_) {
         throw std::invalid_argument("RTP payload type does not match configured L24 stream");
     }
@@ -29,12 +30,24 @@ void ReceivePath::prime(std::uint32_t first_timestamp) {
 }
 
 bool ReceivePath::render_next(AlsaSink& sink) {
-    const auto packet = jitter_buffer_.pop_next();
+    const auto packet = take_next();
     if (!packet.has_value()) {
         return false;
     }
     sink.write(*packet);
     return true;
+}
+
+std::optional<AudioPacket> ReceivePath::take_next() {
+    return jitter_buffer_.pop_next();
+}
+
+std::optional<std::uint32_t> ReceivePath::next_timestamp() const noexcept {
+    return jitter_buffer_.next_timestamp();
+}
+
+std::optional<std::uint32_t> ReceivePath::last_timestamp() const noexcept {
+    return last_timestamp_;
 }
 
 std::size_t ReceivePath::buffered_packets() const noexcept {

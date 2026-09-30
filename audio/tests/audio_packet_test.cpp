@@ -1,5 +1,6 @@
 #include "aes67/audio_packet.hpp"
 #include "aes67/jitter_buffer.hpp"
+#include "aes67/playout_controller.hpp"
 #include "aes67/receive_path.hpp"
 #include "aes67/rtp_packet.hpp"
 #include "aes67/sdp_session.hpp"
@@ -79,6 +80,22 @@ int main() {
     aes67::ReceivePath auto_primed_path(format);
     assert(auto_primed_path.ingest(first_datagram));
     assert(auto_primed_path.buffered_packets() == 1);
+
+    const auto resampled = aes67::resample_linear(source, 24);
+    assert(resampled.samples.size() == format.channels * 24);
+    assert(resampled.samples.front() == source.samples.front());
+
+    aes67::PlayoutController playout({48'000, 48, 20, 20});
+    playout.observe_packet(48'000, 1'000'000'000);
+    assert(playout.mapped());
+    assert(playout.due_time_ns(48'000, 1'000'000'000) == 1'020'000'000);
+    assert(playout.output_samples(20) == 48);
+    playout.observe_packet(48'048, 1'001'000'000);
+    assert(playout.clock_ratio() > 0.99 && playout.clock_ratio() < 1.01);
+
+    aes67::PlayoutController absolute_playout({48'000, 48, 20, 20, true});
+    absolute_playout.observe_packet(48'000, 1'000'000'000);
+    assert(absolute_playout.due_time_ns(48'000, 1'000'000'000) == 1'020'000'000);
 
     bool rejected_short_rtp = false;
     try {

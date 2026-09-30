@@ -16,6 +16,7 @@ public:
     // Packets are keyed by RTP timestamp; duplicates and late packets are dropped.
     bool push(AudioPacket packet);
     void prime(std::uint32_t first_timestamp);
+    std::optional<std::uint32_t> next_timestamp() const noexcept;
     std::optional<AudioPacket> pop_next();
     std::size_t size() const noexcept;
 

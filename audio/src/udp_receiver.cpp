@@ -12,6 +12,7 @@
 #include <cstring>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -42,6 +43,16 @@ UdpReceiver::UdpReceiver(UdpReceiverConfig config) {
         ::close(socket_);
         socket_ = -1;
         throw std::runtime_error(std::string("could not enable UDP address reuse: ") + std::strerror(errno));
+    }
+    if (config.receive_timeout_ms > 0) {
+        timeval timeout{};
+        timeout.tv_sec = static_cast<time_t>(config.receive_timeout_ms / 1000);
+        timeout.tv_usec = static_cast<suseconds_t>((config.receive_timeout_ms % 1000) * 1000);
+        if (::setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+            ::close(socket_);
+            socket_ = -1;
+            throw std::runtime_error(std::string("could not set UDP receive timeout: ") + std::strerror(errno));
+        }
     }
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -82,6 +93,7 @@ bool UdpReceiver::receive_once(ReceivePath& path) {
     std::array<std::uint8_t, 2048> datagram{};
     const auto received = ::recv(socket_, datagram.data(), datagram.size(), 0);
     if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
         throw std::runtime_error(std::string("UDP receive failed: ") + std::strerror(errno));
     }
     return path.ingest(std::span<const std::uint8_t>(datagram.data(), static_cast<std::size_t>(received)));

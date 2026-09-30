@@ -36,7 +36,16 @@ npm run start
 
 The control service listens on `http://127.0.0.1:8080` by default. Set `CONTROL_PORT` to change the port.
 
-The C++ receive path is composed as `UdpReceiver -> ReceivePath -> JitterBuffer -> AlsaSink`. The `aes67_speaker_node` executable wires these components together. PTP is deliberately not used for clock recovery yet.
+The C++ receive path is composed as `UdpReceiver -> ReceivePath -> JitterBuffer -> PlayoutController -> AlsaSink`. The playout controller reads `CLOCK_REALTIME`, which must be disciplined by linuxptp; it maps RTP timestamps to PTP time, applies a playout delay, and adaptively resamples around 48 kHz to compensate for clock and buffer drift.
+
+On Linux, run linuxptp on the media interface before starting the speaker. `ptp4l` exchanges PTP messages and `phc2sys` disciplines `CLOCK_REALTIME` from the interface PHC:
+
+```sh
+sudo ptp4l -i eth0 -m -2
+sudo phc2sys -s eth0 -c CLOCK_REALTIME -m -O 0
+```
+
+Replace `eth0` with the interface carrying the PTP and AES67 traffic. The speaker does not implement PTP messages or a servo itself.
 
 On Linux, after identifying the playback device with `aplay -l`, run:
 
@@ -55,7 +64,7 @@ For an IPv4 multicast stream, provide the group and optional receiving interface
 The receiver joins the group with IGMP and marks its IPv4 socket with DSCP EF (46).
 `aes67::SdpSession` parses and generates the matching single-audio-line SDP profile.
 
-The test sender must begin with RTP timestamp `0` for the default `--first-timestamp`, increment timestamps by 48, and send 288-byte stereo L24 payloads every 1 ms. Use `--help` to list the executable options.
+For synchronized SDP mode, the sender must generate RTP timestamps from the PTP sample clock (the `a=mediaclk:direct=0` declaration), increment by 48, and send 288-byte stereo L24 payloads every 1 ms. All speakers then schedule the same RTP timestamp against the shared PTP epoch. Use `--help` to list the executable options.
 
 The receiver can instead derive the media and network settings from an SDP file:
 
@@ -63,7 +72,7 @@ The receiver can instead derive the media and network settings from an SDP file:
 ./build/aes67_speaker_node --sdp stream.sdp --device hw:1,0
 ```
 
-In SDP mode, the first valid RTP timestamp primes the jitter buffer automatically.
+In SDP mode, the first valid RTP timestamp primes the jitter buffer automatically. The default playout delay is 20 ms and can be changed with `--playout-delay-ms`.
 
 ## Profile
 

@@ -25,6 +25,10 @@ void JitterBuffer::prime(std::uint32_t first_timestamp) {
     next_timestamp_ = first_timestamp;
 }
 
+std::optional<std::uint32_t> JitterBuffer::next_timestamp() const noexcept {
+    return next_timestamp_;
+}
+
 std::optional<AudioPacket> JitterBuffer::pop_next() {
     if (!next_timestamp_.has_value()) {
         return std::nullopt;

@@ -13,6 +13,7 @@ struct UdpReceiverConfig {
     std::string multicast_group;
     std::string multicast_interface = "0.0.0.0";
     bool mark_dscp_ef = true;
+    std::uint32_t receive_timeout_ms = 1;
 };
 
 class UdpReceiver {
