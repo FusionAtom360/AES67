@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ALSA development headers
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
+      - name: Build and test C++ audio path
+        run: |
+          cmake -S . -B build -DAES67_BUILD_TESTS=ON
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+      - name: Build and test TypeScript control plane
+        working-directory: control
+        run: |
+          npm ci
+          npm test

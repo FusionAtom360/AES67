@@ -1,0 +1,4 @@
+build/
+control/node_modules/
+control/dist/
+.vscode/*.log

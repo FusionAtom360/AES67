@@ -1,0 +1,39 @@
+#include "aes67/receive_path.hpp"
+
+#include "aes67/audio_packet.hpp"
+#include "aes67/rtp_packet.hpp"
+
+#include <stdexcept>
+
+namespace aes67 {
+
+ReceivePath::ReceivePath(AudioFormat format, std::uint8_t payload_type,
+                         std::size_t jitter_capacity_packets)
+    : format_(format), payload_type_(payload_type), jitter_buffer_(jitter_capacity_packets) {}
+
+bool ReceivePath::ingest(std::span<const std::uint8_t> datagram) {
+    const auto rtp = parse_rtp(datagram);
+    if (rtp.payload_type != payload_type_) {
+        throw std::invalid_argument("RTP payload type does not match configured L24 stream");
+    }
+    return jitter_buffer_.push(decode_l24(format_, rtp.timestamp, rtp.payload));
+}
+
+void ReceivePath::prime(std::uint32_t first_timestamp) {
+    jitter_buffer_.prime(first_timestamp);
+}
+
+bool ReceivePath::render_next(AlsaSink& sink) {
+    const auto packet = jitter_buffer_.pop_next();
+    if (!packet.has_value()) {
+        return false;
+    }
+    sink.write(*packet);
+    return true;
+}
+
+std::size_t ReceivePath::buffered_packets() const noexcept {
+    return jitter_buffer_.size();
+}
+
+}  // namespace aes67
