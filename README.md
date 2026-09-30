@@ -34,6 +34,8 @@ npm test
 npm run start
 ```
 
+The C++ tests include a loopback sender/receiver integration test, so `ctest` verifies that the repository's RTP sender feeds its own UDP receiver without requiring ALSA hardware.
+
 The control service listens on `http://127.0.0.1:8080` by default. Set `CONTROL_PORT` to change the port.
 
 The C++ receive path is composed as `UdpReceiver -> ReceivePath -> JitterBuffer -> PlayoutController -> AlsaSink`. The playout controller reads `CLOCK_REALTIME`, which must be disciplined by linuxptp; it maps RTP timestamps to PTP time, applies a playout delay, and adaptively resamples around 48 kHz to compensate for clock and buffer drift.
@@ -46,6 +48,15 @@ sudo phc2sys -s eth0 -c CLOCK_REALTIME -m -O 0
 ```
 
 Replace `eth0` with the interface carrying the PTP and AES67 traffic. The speaker does not implement PTP messages or a servo itself.
+
+An optional ALSA capture-to-RTP sender publishes the matching SDP file and sends 1 ms stereo L24 packets:
+
+```sh
+./build/aes67_sender_node --device hw:2,0 \
+	--destination 239.69.0.1 --port 5004 --sdp stream.sdp
+```
+
+Start the sender after linuxptp is locked, then start one or more speakers with the generated `stream.sdp`.
 
 On Linux, after identifying the playback device with `aplay -l`, run:
 

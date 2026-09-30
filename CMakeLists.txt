@@ -7,6 +7,7 @@ option(AES67_BUILD_TESTS "Build the C++ test harness" ON)
 add_library(aes67_audio
     audio/src/audio_packet.cpp
     audio/src/alsa_sink.cpp
+    audio/src/alsa_source.cpp
     audio/src/jitter_buffer.cpp
     audio/src/ptp_clock.cpp
     audio/src/playout_controller.cpp
@@ -14,6 +15,7 @@ add_library(aes67_audio
     audio/src/rtp_packet.cpp
     audio/src/sdp_session.cpp
     audio/src/udp_receiver.cpp
+    audio/src/rtp_sender.cpp
 )
 target_compile_features(aes67_audio PUBLIC cxx_std_20)
 target_include_directories(aes67_audio PUBLIC audio/include)
@@ -31,10 +33,19 @@ add_executable(aes67_speaker_node audio/src/speaker_node.cpp)
 target_compile_features(aes67_speaker_node PRIVATE cxx_std_20)
 target_link_libraries(aes67_speaker_node PRIVATE aes67_audio)
 
+add_executable(aes67_sender_node audio/src/sender_node.cpp)
+target_compile_features(aes67_sender_node PRIVATE cxx_std_20)
+target_link_libraries(aes67_sender_node PRIVATE aes67_audio)
+
 if(AES67_BUILD_TESTS)
     enable_testing()
     add_executable(aes67_audio_tests audio/tests/audio_packet_test.cpp)
     target_compile_features(aes67_audio_tests PRIVATE cxx_std_20)
     target_link_libraries(aes67_audio_tests PRIVATE aes67_audio)
     add_test(NAME aes67_audio_tests COMMAND aes67_audio_tests)
+
+    add_executable(aes67_sender_receiver_test audio/tests/sender_receiver_test.cpp)
+    target_compile_features(aes67_sender_receiver_test PRIVATE cxx_std_20)
+    target_link_libraries(aes67_sender_receiver_test PRIVATE aes67_audio)
+    add_test(NAME aes67_sender_receiver_test COMMAND aes67_sender_receiver_test)
 endif()

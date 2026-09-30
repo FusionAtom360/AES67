@@ -38,6 +38,8 @@ SdpSession SdpSession::parse(std::string_view text) {
     bool has_connection = false;
     bool has_media = false;
     bool has_format = false;
+    bool has_ptp_reference_clock = false;
+    bool has_direct_media_clock = false;
 
     while (!text.empty()) {
         const auto newline = text.find('\n');
@@ -93,6 +95,10 @@ SdpSession SdpSession::parse(std::string_view text) {
                 session.clock_rate = parse_number(codec[1], "clock rate", 0xffffffffU);
                 if (codec.size() == 3) session.channels = static_cast<std::uint8_t>(parse_number(codec[2], "channel count", 255));
                 has_format = true;
+            } else if (value.starts_with("ts-refclk:ptp=IEEE1588-2008")) {
+                has_ptp_reference_clock = true;
+            } else if (value == "mediaclk:direct=0") {
+                has_direct_media_clock = true;
             }
             break;
         default:
@@ -106,7 +112,8 @@ SdpSession SdpSession::parse(std::string_view text) {
         throw std::invalid_argument("incomplete SDP session");
     }
     if (session.media_protocol != "RTP/AVP" || session.encoding_name != "L24" ||
-        session.clock_rate != 48000 || session.channels == 0) {
+        session.clock_rate != 48000 || session.channels == 0 || !has_ptp_reference_clock ||
+        !has_direct_media_clock) {
         throw std::invalid_argument("SDP is not an AES67 L24/48000 stream");
     }
     return session;
@@ -119,9 +126,11 @@ std::string SdpSession::generate() const {
            << "s=" << session_name << "\r\n"
            << "c=IN IP4 " << connection_address << "\r\n"
            << "t=0 0\r\n"
+           << "a=ts-refclk:ptp=IEEE1588-2008:0\r\n"
            << "m=audio " << media_port << ' ' << media_protocol << ' ' << static_cast<unsigned>(payload_type) << "\r\n"
            << "a=rtpmap:" << static_cast<unsigned>(payload_type) << ' ' << encoding_name << '/' << clock_rate;
     if (channels != 1) output << '/' << static_cast<unsigned>(channels);
+        output << "\r\na=mediaclk:direct=0";
     output << "\r\n";
     return output.str();
 }
