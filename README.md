@@ -45,7 +45,25 @@ On Linux, after identifying the playback device with `aplay -l`, run:
 	--payload-type 96 --first-timestamp 0 --device hw:1,0
 ```
 
+For an IPv4 multicast stream, provide the group and optional receiving interface:
+
+```sh
+./build/aes67_speaker_node --multicast 239.69.0.1 --interface 192.168.1.20 \
+	--port 5004 --payload-type 96 --device hw:1,0
+```
+
+The receiver joins the group with IGMP and marks its IPv4 socket with DSCP EF (46).
+`aes67::SdpSession` parses and generates the matching single-audio-line SDP profile.
+
 The test sender must begin with RTP timestamp `0` for the default `--first-timestamp`, increment timestamps by 48, and send 288-byte stereo L24 payloads every 1 ms. Use `--help` to list the executable options.
+
+The receiver can instead derive the media and network settings from an SDP file:
+
+```sh
+./build/aes67_speaker_node --sdp stream.sdp --device hw:1,0
+```
+
+In SDP mode, the first valid RTP timestamp primes the jitter buffer automatically.
 
 ## Profile
 

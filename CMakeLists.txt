@@ -10,6 +10,7 @@ add_library(aes67_audio
     audio/src/jitter_buffer.cpp
     audio/src/receive_path.cpp
     audio/src/rtp_packet.cpp
+    audio/src/sdp_session.cpp
     audio/src/udp_receiver.cpp
 )
 target_compile_features(aes67_audio PUBLIC cxx_std_20)

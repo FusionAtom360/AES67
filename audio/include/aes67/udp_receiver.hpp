@@ -7,9 +7,18 @@
 
 namespace aes67 {
 
+struct UdpReceiverConfig {
+    std::uint16_t port = 5004;
+    std::string bind_address = "0.0.0.0";
+    std::string multicast_group;
+    std::string multicast_interface = "0.0.0.0";
+    bool mark_dscp_ef = true;
+};
+
 class UdpReceiver {
 public:
     UdpReceiver(std::uint16_t port, std::string bind_address = "0.0.0.0");
+    explicit UdpReceiver(UdpReceiverConfig config);
     ~UdpReceiver();
 
     UdpReceiver(const UdpReceiver&) = delete;

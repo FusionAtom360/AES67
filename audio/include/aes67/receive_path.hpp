@@ -27,6 +27,7 @@ private:
     AudioFormat format_;
     std::uint8_t payload_type_;
     JitterBuffer jitter_buffer_;
+    bool primed_ = false;
 };
 
 }  // namespace aes67

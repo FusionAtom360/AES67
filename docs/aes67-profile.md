@@ -25,6 +25,6 @@ The current receive path now parses RTP v2 datagrams from UDP, validates the con
 ## Explicit non-goals for this skeleton
 
 - PTP announce, sync, follow-up, delay request, and servo state machine
-- RTP session management, SDP, SAP, and multicast socket lifecycle
+- RTP session management, SAP, and multicast sender lifecycle
 - ALSA/CoreAudio/WASAPI device adapters
 - Authentication, authorization, and encrypted control transport

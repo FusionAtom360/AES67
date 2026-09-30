@@ -2,6 +2,7 @@
 #include "aes67/jitter_buffer.hpp"
 #include "aes67/receive_path.hpp"
 #include "aes67/rtp_packet.hpp"
+#include "aes67/sdp_session.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -75,6 +76,10 @@ int main() {
     assert(receive_path.buffered_packets() == 2);
     assert(!receive_path.ingest(first_datagram));
 
+    aes67::ReceivePath auto_primed_path(format);
+    assert(auto_primed_path.ingest(first_datagram));
+    assert(auto_primed_path.buffered_packets() == 1);
+
     bool rejected_short_rtp = false;
     try {
         aes67::parse_rtp(std::vector<std::uint8_t>(11));
@@ -82,6 +87,30 @@ int main() {
         rejected_short_rtp = true;
     }
     assert(rejected_short_rtp);
+
+    aes67::SdpSession session;
+    session.session_name = "Studio monitor";
+    session.connection_address = "239.69.0.1";
+    session.media_port = 5004;
+    session.payload_type = 97;
+    session.channels = 2;
+    const auto sdp = session.generate();
+    const auto parsed_sdp = aes67::SdpSession::parse(sdp);
+    assert(parsed_sdp.session_name == session.session_name);
+    assert(parsed_sdp.connection_address == session.connection_address);
+    assert(parsed_sdp.media_port == session.media_port);
+    assert(parsed_sdp.payload_type == session.payload_type);
+    assert(parsed_sdp.encoding_name == "L24");
+    assert(parsed_sdp.clock_rate == 48000);
+    assert(parsed_sdp.channels == 2);
+
+    bool rejected_incomplete_sdp = false;
+    try {
+        aes67::SdpSession::parse("v=0\r\ns=missing fields\r\n");
+    } catch (const std::invalid_argument&) {
+        rejected_incomplete_sdp = true;
+    }
+    assert(rejected_incomplete_sdp);
 
     std::cout << "audio packet tests passed\n";
 }
