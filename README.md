@@ -36,7 +36,32 @@ npm run start
 
 The C++ tests include a loopback sender/receiver integration test, so `ctest` verifies that the repository's RTP sender feeds its own UDP receiver without requiring ALSA hardware.
 
-The control service listens on `http://127.0.0.1:8080` by default. Set `CONTROL_PORT` to change the port.
+The control service listens on `http://127.0.0.1:8080` by default. Set `CONTROL_PORT` or `CONTROL_HOST` to change the listener. To control a speaker from another host, bind it to the speaker network interface and restrict access with the host firewall:
+
+```sh
+CONTROL_HOST=0.0.0.0 CONTROL_PORT=8080 npm run start
+```
+
+The control daemon exposes:
+
+- `GET /health` for process, PTP, and stream health
+- `GET /v1/status` for complete node state
+- `PUT /v1/config` to update node configuration
+- `POST /v1/subscribe` and `POST /v1/unsubscribe` for stream lifecycle
+- `GET /v1/volume` and `PUT /v1/volume` with `{ "volume": 0.0..1.0 }`
+- WebSocket `GET /v1/events` for status events and `subscribe`, `unsubscribe`, `setVolume`, and `status` commands
+
+When started from `control`, the daemon launches `../build/aes67_speaker_node` for subscriptions. Set `AES67_SPEAKER_EXECUTABLE` to override the executable path and `AES67_ALSA_DEVICE` to select the playback device. For example:
+
+```sh
+AES67_ALSA_DEVICE=hw:1,0 npm run start
+curl -X POST http://127.0.0.1:8080/v1/subscribe \
+	-H 'content-type: application/json' \
+	-d '{"destination":"239.69.0.1","destinationPort":5004}'
+curl -X PUT http://127.0.0.1:8080/v1/volume \
+	-H 'content-type: application/json' -d '{"volume":0.65}'
+curl -X POST http://127.0.0.1:8080/v1/unsubscribe
+```
 
 The C++ receive path is composed as `UdpReceiver -> ReceivePath -> JitterBuffer -> PlayoutController -> AlsaSink`. The playout controller reads `CLOCK_REALTIME`, which must be disciplined by linuxptp; it maps RTP timestamps to PTP time, applies a playout delay, and adaptively resamples around 48 kHz to compensate for clock and buffer drift.
 
