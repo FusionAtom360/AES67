@@ -9,6 +9,12 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
+
+#undef assert
+#define assert(condition) do { \
+    if (!(condition)) throw std::runtime_error("test assertion failed: " #condition); \
+} while (false)
 
 int main() {
     constexpr std::uint16_t port = 46067;
@@ -40,15 +46,11 @@ int main() {
 
     if (std::getenv("AES67_TEST_MULTICAST") != nullptr) {
         constexpr std::uint16_t multicast_port = 46068;
-        try {
-            aes67::UdpReceiver multicast_receiver({multicast_port, "0.0.0.0", "239.69.0.2", "0.0.0.0", false, 100});
-            aes67::RtpSender multicast_sender({"239.69.0.2", multicast_port, "0.0.0.0", 96, false});
-            multicast_sender.send(source, 8);
-            aes67::ReceivePath multicast_path(format, 96);
-            assert(multicast_receiver.receive_once(multicast_path));
-            std::cout << "multicast sender/receiver test passed\n";
-        } catch (const std::exception& error) {
-            std::cout << "multicast test skipped: " << error.what() << "\n";
-        }
+        aes67::UdpReceiver multicast_receiver({multicast_port, "0.0.0.0", "239.69.0.2", "0.0.0.0", false, 100});
+        aes67::RtpSender multicast_sender({"239.69.0.2", multicast_port, "0.0.0.0", 96, false});
+        multicast_sender.send(source, 8);
+        aes67::ReceivePath multicast_path(format, 96);
+        assert(multicast_receiver.receive_once(multicast_path));
+        std::cout << "multicast sender/receiver test passed\n";
     }
 }

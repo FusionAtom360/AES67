@@ -16,6 +16,13 @@ double clamp_ratio(double ratio) {
     return std::clamp(ratio, 0.98, 1.02);
 }
 
+std::uint64_t saturate_time(long double time_ns) {
+    if (time_ns <= 0.0L) return 0;
+    const auto maximum = static_cast<long double>(std::numeric_limits<std::uint64_t>::max());
+    if (time_ns >= maximum) return std::numeric_limits<std::uint64_t>::max();
+    return static_cast<std::uint64_t>(time_ns);
+}
+
 }  // namespace
 
 PlayoutController::PlayoutController(PlayoutConfig config) : config_(config) {
@@ -35,6 +42,16 @@ void PlayoutController::observe_packet(std::uint32_t rtp_timestamp, std::uint64_
     }
 
     const auto rtp_delta = timestamp_delta(rtp_timestamp, last_rtp_timestamp_);
+    if (rtp_delta < 0 || ptp_time_ns < last_ptp_time_ns_) {
+        // A source restart or PTP step invalidates the old timestamp mapping.
+        reference_rtp_timestamp_ = rtp_timestamp;
+        reference_ptp_time_ns_ = ptp_time_ns;
+        last_rtp_timestamp_ = rtp_timestamp;
+        last_ptp_time_ns_ = ptp_time_ns;
+        clock_ratio_ = 1.0;
+        frame_remainder_ = 0.0;
+        return;
+    }
     const auto ptp_delta = ptp_time_ns - last_ptp_time_ns_;
     if (rtp_delta > 0 && ptp_delta > 0) {
         const auto expected_ns = static_cast<double>(rtp_delta) * 1'000'000'000.0 / config_.sample_rate;
@@ -59,16 +76,17 @@ std::uint64_t PlayoutController::due_time_ns(std::uint32_t rtp_timestamp,
         const auto delta = static_cast<std::int64_t>(static_cast<std::int32_t>(
             rtp_timestamp - static_cast<std::uint32_t>(now_ticks)));
         const auto target_ticks = static_cast<std::int64_t>(now_ticks) + delta;
-        const auto target_ns = target_ticks * 1'000'000'000LL /
-                               static_cast<std::int64_t>(config_.sample_rate);
-        const auto due = target_ns + static_cast<std::int64_t>(config_.delay_ms) * 1'000'000LL;
-        return due > 0 ? static_cast<std::uint64_t>(due) : 0;
+        const auto target_ns = static_cast<long double>(target_ticks) * 1'000'000'000.0L /
+                       static_cast<long double>(config_.sample_rate);
+        const auto due = target_ns + static_cast<long double>(config_.delay_ms) * 1'000'000.0L;
+        return saturate_time(due);
     }
     const auto delta = static_cast<std::int64_t>(timestamp_delta(rtp_timestamp, reference_rtp_timestamp_));
     const auto media_ns = delta * 1'000'000'000LL / static_cast<std::int64_t>(config_.sample_rate);
     const auto delay_ns = static_cast<std::int64_t>(config_.delay_ms) * 1'000'000LL;
-    const auto due = static_cast<std::int64_t>(reference_ptp_time_ns_) + delay_ns + media_ns;
-    return due > 0 ? static_cast<std::uint64_t>(due) : 0;
+    const auto due = static_cast<long double>(reference_ptp_time_ns_) +
+                     static_cast<long double>(delay_ns) + static_cast<long double>(media_ns);
+    return saturate_time(due);
 }
 
 std::size_t PlayoutController::output_samples(std::size_t buffered_packets) {

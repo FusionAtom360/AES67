@@ -1,7 +1,7 @@
 [Unit]
 Description=AES67 ALSA capture RTP sender
-After=network-online.target ptp4l.service phc2sys.service
-Wants=network-online.target
+After=network-online.target aes67-ptp4l.service aes67-phc2sys.service
+Wants=network-online.target aes67-ptp4l.service aes67-phc2sys.service
 
 [Service]
 Type=simple

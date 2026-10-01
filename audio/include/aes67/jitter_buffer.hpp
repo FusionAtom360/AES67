@@ -13,7 +13,8 @@ class JitterBuffer {
 public:
     explicit JitterBuffer(std::size_t capacity_packets = 64);
 
-    // Packets are keyed by RTP timestamp; duplicates and late packets are dropped.
+    // Packets are keyed by RTP timestamp; duplicates and late packets are dropped
+    // using RTP serial-number arithmetic so the 32-bit timestamp can wrap.
     bool push(AudioPacket packet);
     void prime(std::uint32_t first_timestamp);
     std::optional<std::uint32_t> next_timestamp() const noexcept;

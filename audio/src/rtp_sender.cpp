@@ -45,12 +45,16 @@ RtpSender::RtpSender(RtpSenderConfig config) : impl_(new Impl{}) {
     if (config.mark_dscp_ef) {
         const int dscp_ef = 46 << 2;
         if (::setsockopt(impl_->socket, IPPROTO_IP, IP_TOS, &dscp_ef, sizeof(dscp_ef)) < 0) {
+            ::close(impl_->socket);
+            impl_->socket = -1;
             throw std::runtime_error(std::string("could not set RTP DSCP EF: ") + std::strerror(errno));
         }
     }
     impl_->destination.sin_family = AF_INET;
     impl_->destination.sin_port = htons(config.port);
     if (inet_pton(AF_INET, config.destination_address.c_str(), &impl_->destination.sin_addr) != 1) {
+        ::close(impl_->socket);
+        impl_->socket = -1;
         throw std::invalid_argument("RTP destination is not IPv4: " + config.destination_address);
     }
     impl_->multicast = IN_MULTICAST(ntohl(impl_->destination.sin_addr.s_addr));
@@ -59,6 +63,8 @@ RtpSender::RtpSender(RtpSenderConfig config) : impl_(new Impl{}) {
         if (inet_pton(AF_INET, config.interface_address.c_str(), &interface_address) != 1 ||
             ::setsockopt(impl_->socket, IPPROTO_IP, IP_MULTICAST_IF,
                          &interface_address, sizeof(interface_address)) < 0) {
+            ::close(impl_->socket);
+            impl_->socket = -1;
             throw std::invalid_argument("invalid multicast interface: " + config.interface_address);
         }
     }

@@ -1,5 +1,6 @@
 #include "aes67/sdp_session.hpp"
 
+#include <arpa/inet.h>
 #include <charconv>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +27,12 @@ std::vector<std::string_view> split(std::string_view value, char delimiter) {
         if (position == std::string_view::npos) return parts;
         value.remove_prefix(position + 1);
     }
+}
+
+bool is_ipv4(std::string_view value) {
+    in_addr address{};
+    const std::string text(value);
+    return inet_pton(AF_INET, text.c_str(), &address) == 1;
 }
 
 }  // namespace
@@ -70,6 +77,7 @@ SdpSession SdpSession::parse(std::string_view text) {
             if (fields.size() != 3 || fields[0] != "IN" || fields[1] != "IP4") {
                 throw std::invalid_argument("invalid SDP connection");
             }
+            if (!is_ipv4(fields[2])) throw std::invalid_argument("invalid SDP IPv4 address");
             session.connection_address = std::string(fields[2]);
             has_connection = true;
             break;
@@ -78,6 +86,7 @@ SdpSession SdpSession::parse(std::string_view text) {
             const auto fields = split(value, ' ');
             if (fields.size() != 4 || fields[0] != "audio") throw std::invalid_argument("invalid SDP audio media");
             session.media_port = static_cast<std::uint16_t>(parse_number(fields[1], "media port", 65535));
+            if (session.media_port == 0) throw std::invalid_argument("invalid SDP media port");
             session.media_protocol = std::string(fields[2]);
             session.payload_type = static_cast<std::uint8_t>(parse_number(fields[3], "payload type", 127));
             has_media = true;
@@ -88,7 +97,7 @@ SdpSession SdpSession::parse(std::string_view text) {
                 const auto fields = split(value.substr(7), ' ');
                 if (fields.size() != 2) throw std::invalid_argument("invalid SDP rtpmap");
                 const auto codec = split(fields[1], '/');
-                if (parse_number(fields[0], "rtpmap payload type", 127) != session.payload_type || codec.size() < 2) {
+                if (parse_number(fields[0], "rtpmap payload type", 127) != session.payload_type || codec.size() != 3) {
                     throw std::invalid_argument("SDP rtpmap does not match media");
                 }
                 session.encoding_name = std::string(codec[0]);
@@ -112,7 +121,7 @@ SdpSession SdpSession::parse(std::string_view text) {
         throw std::invalid_argument("incomplete SDP session");
     }
     if (session.media_protocol != "RTP/AVP" || session.encoding_name != "L24" ||
-        session.clock_rate != 48000 || session.channels == 0 || !has_ptp_reference_clock ||
+        session.clock_rate != 48000 || session.channels != 2 || !has_ptp_reference_clock ||
         !has_direct_media_clock) {
         throw std::invalid_argument("SDP is not an AES67 L24/48000 stream");
     }

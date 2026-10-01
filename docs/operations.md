@@ -42,6 +42,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now aes67-ptp4l.service aes67-phc2sys.service aes67-control.service
 ```
 
+The control daemon persists configuration, routing, and volume state atomically
+to `AES67_STATE_FILE` (default deployment path `/var/lib/aes67/control-state.json`).
+Keep that path on a writable persistent filesystem.
+
 Enable `aes67-sender.service` only on a capture/source node.
 
 ## OTA updates
@@ -57,4 +61,12 @@ Rollback uses the previous symlink recorded by the updater:
 
 ```sh
 sudo ./deploy/ota_rollback.sh
+```
+
+The updater normalizes activation links to `releases/<version>`, removes the
+staging directory through an atomic rename, and checks that the control service
+is active after restart. Run the local lifecycle test before installing changes:
+
+```sh
+./deploy/ota_test.sh
 ```

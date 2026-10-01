@@ -20,11 +20,11 @@ The audio payload contains `channels * 48 * 3` bytes. A stereo packet therefore 
 
 The RTP timestamp advances by 48 for each packet. A production node must derive its media clock from the selected PTP grandmaster and expose lock/holdover state to the control plane. The C++ packetizer does not claim to implement PTP, clock recovery, RTP headers, or a physical audio device yet.
 
-The current receive path parses RTP v2 datagrams from UDP, validates the configured dynamic payload type, unpacks L24 into signed PCM, orders packets by RTP timestamp, maps the stream to the PTP-disciplined system clock, applies configurable playout delay, adaptively resamples for clock/buffer drift, and writes stereo PCM to ALSA as `S24_3LE`. PTP protocol exchange and servo operation are delegated to linuxptp (`ptp4l` and `phc2sys`).
+The current receive path parses RTP v2 datagrams from UDP, validates the configured dynamic payload type and stereo L24 profile, locks to one RTP source, unpacks L24 into signed PCM, orders packets by wrap-safe RTP timestamp, maps the stream to the PTP-disciplined system clock, applies configurable playout delay, adaptively resamples for clock/buffer drift, and writes stereo PCM to ALSA as `S24_3LE`. PTP protocol exchange and servo operation are delegated to linuxptp (`ptp4l` and `phc2sys`). Backward RTP/PTP clock steps remap the playout reference.
 
 ## Explicit non-goals for this skeleton
 
 - PTP announce, sync, follow-up, delay request, and servo state machine in this process
 - RTP session management, SAP, and multicast sender lifecycle
-- ALSA/CoreAudio/WASAPI device adapters
+- CoreAudio/WASAPI device adapters
 - Authentication, authorization, and encrypted control transport

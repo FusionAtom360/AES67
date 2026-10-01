@@ -21,7 +21,8 @@ docs/        pinned profile and implementation notes
 
 ## Build and test
 
-Requirements: CMake 3.20+, a C++20 compiler, Node.js 20+, and npm.
+Requirements: CMake 3.20+, a C++20 compiler, ALSA development/runtime packages
+(`libasound2-dev` and `libasound2` on Debian-based Linux), Node.js 20+, and npm.
 
 ```sh
 cmake -S . -B build -DAES67_BUILD_TESTS=ON

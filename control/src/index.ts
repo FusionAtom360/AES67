@@ -1,18 +1,21 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFileSync } from "node:fs";
-import { connect as connectSocket } from "node:net";
-import { resolve } from "node:path";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { connect as connectSocket, isIPv4 } from "node:net";
+import { dirname, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { SapRegistry, type DiscoveryPublisher, type DiscoveryRegistry } from "./discovery.js";
+import { SapAnnouncer, SapRegistry, type DiscoveryPublisher, type DiscoveryRegistry } from "./discovery.js";
 
 const webUiPath = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../public/index.html");
+const maxRequestBytes = 1 << 20;
+const maxWebSocketPayload = 1 << 20;
 
 export interface NodeConfig {
   nodeId: string;
   channelCount: number;
+  payloadType: number;
   destination: string;
   destinationPort: number;
 }
@@ -32,6 +35,7 @@ export interface NodeStatus {
     ok: boolean;
     ptpLocked: boolean;
     streamRunning: boolean;
+    discoveryAvailable: boolean;
   };
 }
 
@@ -62,20 +66,73 @@ export interface RoutingState {
 export const defaultConfig: NodeConfig = {
   nodeId: "speaker-node-01",
   channelCount: 2,
+  payloadType: 96,
   destination: "239.69.0.1",
   destinationPort: 5004,
 };
+
+interface PersistedState {
+  config: NodeConfig;
+  routing: RoutingState;
+  volume: number;
+}
+
+class StateStore {
+  public constructor(private readonly path: string | undefined) {}
+
+  public load(initialConfig: NodeConfig): PersistedState {
+    const fallback = { config: { ...initialConfig }, routing: { groups: [], dsp: {}, routes: {} }, volume: 1 };
+    if (this.path === undefined) return fallback;
+    try {
+      const stored = JSON.parse(readFileSync(this.path, "utf8")) as Partial<PersistedState>;
+      if (!isNodeConfig(stored.config) || !isRoutingState(stored.routing) ||
+          typeof stored.volume !== "number" || !Number.isFinite(stored.volume) || stored.volume < 0 || stored.volume > 1) {
+        throw new Error("invalid persisted control state");
+      }
+      return { config: stored.config, routing: stored.routing, volume: stored.volume };
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(`could not load control state: ${errorMessage(error)}`);
+      }
+      return fallback;
+    }
+  }
+
+  public save(status: NodeStatus, routing: RoutingState): void {
+    if (this.path === undefined) return;
+    const temporaryPath = `${this.path}.${process.pid}.tmp`;
+    try {
+      mkdirSync(dirname(this.path), { recursive: true });
+      writeFileSync(temporaryPath, JSON.stringify({ config: status.config, routing, volume: status.volume }) + "\n");
+      renameSync(temporaryPath, this.path);
+    } catch (error: unknown) {
+      console.error(`could not persist control state: ${errorMessage(error)}`);
+    }
+  }
+}
+
+class MutationQueue {
+  private tail = Promise.resolve();
+
+  public run<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(operation, operation);
+    this.tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
 
 export interface SpeakerRuntime {
   subscribe(config: NodeConfig): Promise<void>;
   unsubscribe(): Promise<void>;
   setVolume(volume: number): Promise<void>;
   isRunning(): boolean;
+  onStateChange?(listener: () => void): () => void;
 }
 
 export class ProcessSpeakerRuntime implements SpeakerRuntime {
   private child: ChildProcess | undefined;
   private socketPath: string | undefined;
+  private readonly stateListeners = new Set<() => void>();
 
   public async subscribe(config: NodeConfig): Promise<void> {
     await this.unsubscribe();
@@ -85,20 +142,26 @@ export class ProcessSpeakerRuntime implements SpeakerRuntime {
     const args = isMulticast(config.destination)
       ? ["--multicast", config.destination]
       : ["--bind", "0.0.0.0"];
-    args.push("--port", String(config.destinationPort), "--payload-type", "96",
+    args.push("--port", String(config.destinationPort), "--payload-type", String(config.payloadType),
       "--device", process.env.AES67_ALSA_DEVICE ?? "default", "--control-socket", this.socketPath);
     const child = spawn(executable, args, { stdio: "ignore" });
     this.child = child;
+    child.once("exit", () => {
+      if (this.child === child) this.child = undefined;
+      console.error(`speaker process exited: code=${child.exitCode ?? "none"} signal=${child.signalCode ?? "none"}`);
+      this.notifyStateChange();
+    });
     await new Promise<void>((resolvePromise, reject) => {
-      const onError = (error: Error) => reject(error);
+      const onError = (error: Error) => {
+        if (this.child === child) this.child = undefined;
+        this.notifyStateChange();
+        reject(error);
+      };
       child.once("error", onError);
       child.once("spawn", () => {
         child.off("error", onError);
         resolvePromise();
       });
-    });
-    child.once("exit", () => {
-      if (this.child === child) this.child = undefined;
     });
   }
 
@@ -106,6 +169,7 @@ export class ProcessSpeakerRuntime implements SpeakerRuntime {
     const child = this.child;
     if (child === undefined) return;
     this.child = undefined;
+    this.notifyStateChange();
     if (child.exitCode !== null || child.signalCode !== null) return;
     await new Promise<void>((resolvePromise) => {
       child.once("exit", () => resolvePromise());
@@ -138,32 +202,67 @@ export class ProcessSpeakerRuntime implements SpeakerRuntime {
   public isRunning(): boolean {
     return this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null;
   }
+
+  public onStateChange(listener: () => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  private notifyStateChange(): void {
+    for (const listener of this.stateListeners) listener();
+  }
 }
 
 export function createControlServer(initialConfig: NodeConfig = defaultConfig,
                                     runtime: SpeakerRuntime = new ProcessSpeakerRuntime(),
-                                    discovery: DiscoveryPublisher = new NoopDiscoveryPublisher(),
+                                    discovery: DiscoveryPublisher = new SapAnnouncer(),
                                     registry: DiscoveryRegistry = new SapRegistry()): Server {
+  const stateStore = new StateStore(process.env.AES67_STATE_FILE);
+  const persisted = stateStore.load(initialConfig);
   const status: NodeStatus = {
     profile: "AES67-L24-48k-1ms",
     ptp: "unlocked",
     stream: "stopped",
-    config: { ...initialConfig },
+    config: { ...persisted.config },
     subscription: {
       active: false,
-      destination: initialConfig.destination,
-      destinationPort: initialConfig.destinationPort,
+      destination: persisted.config.destination,
+      destinationPort: persisted.config.destinationPort,
     },
-    volume: 1,
-    health: { ok: true, ptpLocked: false, streamRunning: false },
+    volume: persisted.volume,
+    health: { ok: true, ptpLocked: false, streamRunning: false, discoveryAvailable: false },
   };
-  const websocket = new WebSocketHub(status, runtime, discovery);
-  const routing: RoutingState = { groups: [], dsp: {}, routes: {} };
+  const mutations = new MutationQueue();
+  const routing: RoutingState = persisted.routing;
+  const persist = () => stateStore.save(status, routing);
+  const websocket = new WebSocketHub(status, runtime, discovery, mutations, persist);
+  const refreshHealth = () => {
+    const streamRunning = status.subscription.active && runtime.isRunning();
+    status.health.streamRunning = streamRunning;
+    status.stream = streamRunning ? "running" : "stopped";
+    status.health.ok = (!status.subscription.active || streamRunning) && status.health.discoveryAvailable;
+    websocket.broadcast(status);
+  };
+  const removeRuntimeListener = runtime.onStateChange?.(refreshHealth);
   const server = createServer((request, response) =>
-    handleRequest(request, response, status, websocket, runtime, discovery, registry, routing));
+    handleRequest(request, response, status, websocket, runtime, discovery, registry, routing, mutations, persist));
   server.on("upgrade", (request, socket) => websocket.accept(request, socket));
-  server.on("close", () => { websocket.close(); discovery.close(); registry.close(); });
-  void registry.start().catch(() => undefined);
+  server.on("close", () => {
+    removeRuntimeListener?.();
+    websocket.close();
+    discovery.close();
+    registry.close();
+  });
+  void registry.start().then(() => {
+    status.health.discoveryAvailable = true;
+    status.health.ok = (!status.subscription.active || runtime.isRunning());
+    websocket.broadcast(status);
+  }).catch((error: unknown) => {
+    status.health.discoveryAvailable = false;
+    status.health.ok = false;
+    console.error(`discovery registry failed: ${errorMessage(error)}`);
+    websocket.broadcast(status);
+  });
   return server;
 }
 
@@ -176,10 +275,61 @@ function snapshot(status: NodeStatus): NodeStatus {
   };
 }
 
+async function activateSubscription(config: NodeConfig, status: NodeStatus,
+                                    runtime: SpeakerRuntime, discovery: DiscoveryPublisher): Promise<void> {
+  const previousConfig = { ...status.config };
+  const wasActive = status.subscription.active;
+  try {
+    await runtime.subscribe(config);
+    await discovery.publish(config);
+  } catch (error: unknown) {
+    try {
+      if (wasActive) {
+        await runtime.subscribe(previousConfig);
+        await discovery.publish(previousConfig);
+      } else {
+        await runtime.unsubscribe();
+        await discovery.withdraw();
+      }
+    } catch {
+      // Preserve the original operation failure; health reconciliation reports the runtime state.
+    }
+    throw error;
+  }
+  status.subscription = {
+    active: true,
+    destination: config.destination,
+    destinationPort: config.destinationPort,
+  };
+  status.stream = "running";
+  status.health.streamRunning = true;
+  status.health.ok = status.health.discoveryAvailable;
+}
+
+async function deactivateSubscription(status: NodeStatus, runtime: SpeakerRuntime,
+                                      discovery: DiscoveryPublisher): Promise<void> {
+  const previousConfig = { ...status.config };
+  await discovery.withdraw();
+  try {
+    await runtime.unsubscribe();
+  } catch (error: unknown) {
+    try {
+      if (status.subscription.active) await discovery.publish(previousConfig);
+    } catch {
+      // Preserve the original operation failure; health reconciliation reports the runtime state.
+    }
+    throw error;
+  }
+  status.subscription.active = false;
+  status.stream = "stopped";
+  status.health.streamRunning = false;
+  status.health.ok = status.health.discoveryAvailable;
+}
+
 function handleRequest(request: IncomingMessage, response: ServerResponse, status: NodeStatus,
                        websocket: WebSocketHub, runtime: SpeakerRuntime,
                        discovery: DiscoveryPublisher, registry: DiscoveryRegistry,
-                       routing: RoutingState): void {
+                       routing: RoutingState, mutations: MutationQueue, persist: () => void): void {
   const path = request.url?.split("?", 1)[0] ?? "/";
   if (request.method === "GET" && path === "/") {
     response.statusCode = 200;
@@ -205,34 +355,37 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     return;
   }
   if (request.method === "PUT" && path === "/v1/config") {
-    collectJson(request, (body) => {
+    collectJson(request, response, (body) => {
       if (!isNodeConfig(body)) {
         send(response, 400, { error: "invalid node configuration" });
         return;
       }
-      status.config = body;
-      send(response, 200, status.config);
-      websocket.broadcast(status);
+      void mutations.run(async () => {
+        const proposed = { ...body };
+        if (status.subscription.active) {
+          await activateSubscription(proposed, status, runtime, discovery);
+        }
+        status.config = proposed;
+        send(response, 200, status.config);
+        websocket.broadcast(status);
+      }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
     });
     return;
   }
   if (request.method === "POST" && path === "/v1/subscribe") {
-    collectJson(request, (body) => {
+    collectJson(request, response, (body) => {
       if (body !== undefined && !isSubscriptionRequest(body)) {
         send(response, 400, { error: "invalid subscription" });
         return;
       }
       const subscription = body as Partial<NodeConfig> | undefined;
-      if (subscription?.destination !== undefined) status.config.destination = subscription.destination;
-      if (subscription?.destinationPort !== undefined) status.config.destinationPort = subscription.destinationPort;
-      void runtime.subscribe(status.config).then(() => discovery.publish(status.config)).then(() => {
-        status.subscription = {
-          active: true,
-          destination: status.config.destination,
-          destinationPort: status.config.destinationPort,
-        };
-        status.stream = "running";
-        status.health.streamRunning = true;
+      const proposed = { ...status.config,
+        ...(subscription?.destination === undefined ? {} : { destination: subscription.destination }),
+        ...(subscription?.destinationPort === undefined ? {} : { destinationPort: subscription.destinationPort }),
+      };
+      void mutations.run(async () => {
+        await activateSubscription(proposed, status, runtime, discovery);
+        status.config = proposed;
         send(response, 200, snapshot(status));
         websocket.broadcast(status);
       }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
@@ -240,7 +393,7 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     return;
   }
   if (request.method === "POST" && path === "/v1/routes") {
-    collectJson(request, (body) => {
+    collectJson(request, response, (body) => {
       const streamId = isRouteRequest(body) ? body.streamId : undefined;
       const stream = streamId === undefined ? undefined : registry.get(streamId);
       if (stream === undefined) {
@@ -248,13 +401,11 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
         return;
       }
       const routedConfig = { ...status.config, destination: stream.destination,
-        destinationPort: stream.destinationPort, channelCount: stream.channelCount };
-      void runtime.subscribe(routedConfig).then(() => {
+        destinationPort: stream.destinationPort, channelCount: stream.channelCount,
+        payloadType: stream.payloadType };
+      void mutations.run(async () => {
+        await activateSubscription(routedConfig, status, runtime, discovery);
         status.config = routedConfig;
-        status.subscription = { active: true, destination: stream.destination,
-          destinationPort: stream.destinationPort };
-        status.stream = "running";
-        status.health.streamRunning = true;
         send(response, 200, snapshot(status));
         websocket.broadcast(status);
       }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
@@ -262,23 +413,26 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     return;
   }
   if (request.method === "PUT" && path === "/v1/routes") {
-    collectJson(request, (body) => {
+    collectJson(request, response, (body) => {
       if (!isRouteMatrix(body)) {
         send(response, 400, { error: "routes must map a streamId to speakerIds" });
         return;
       }
-      routing.routes[body.streamId] = body.speakerIds;
-      const localSpeakerId = status.config.nodeId;
-      const stream = registry.get(body.streamId);
-      const localSelected = body.speakerIds.includes(localSpeakerId);
-      const operation = localSelected && stream !== undefined
-        ? runtime.subscribe({ ...status.config, destination: stream.destination,
-          destinationPort: stream.destinationPort, channelCount: stream.channelCount })
-        : runtime.unsubscribe();
-      void operation.then(() => {
+      void mutations.run(async () => {
+        const localSpeakerId = status.config.nodeId;
+        const stream = registry.get(body.streamId);
+        const localSelected = body.speakerIds.includes(localSpeakerId);
+        if (localSelected && stream !== undefined) {
+          const routedConfig = { ...status.config, destination: stream.destination,
+            destinationPort: stream.destinationPort, channelCount: stream.channelCount,
+            payloadType: stream.payloadType };
+          await activateSubscription(routedConfig, status, runtime, discovery);
+          status.config = routedConfig;
+        } else {
+          await deactivateSubscription(status, runtime, discovery);
+        }
+        routing.routes[body.streamId] = body.speakerIds;
         status.subscription.active = localSelected;
-        status.stream = localSelected ? "running" : "stopped";
-        status.health.streamRunning = localSelected;
         send(response, 200, { ...routing, streams: registry.list(), localSpeakerId });
         websocket.broadcast(status);
       }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
@@ -287,45 +441,54 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
   }
   if (request.method === "PUT" && path.match(/^\/v1\/groups\/[^/]+$/)) {
     const id = path.split("/").pop()!;
-    collectJson(request, (body) => {
+    collectJson(request, response, (body) => {
       if (!isSpeakerGroup(body) || body.id !== id) {
         send(response, 400, { error: "invalid speaker group" });
         return;
       }
-      routing.groups = [...routing.groups.filter((group) => group.id !== id), body];
-      send(response, 200, body);
-      websocket.broadcast(status);
+      void mutations.run(async () => {
+        routing.groups = [...routing.groups.filter((group) => group.id !== id), body];
+        send(response, 200, body);
+        websocket.broadcast(status);
+      });
     });
     return;
   }
   if (request.method === "DELETE" && path.match(/^\/v1\/groups\/[^/]+$/)) {
     const id = path.split("/").pop()!;
-    routing.groups = routing.groups.filter((group) => group.id !== id);
-    send(response, 200, { groups: routing.groups });
-    websocket.broadcast(status);
+    void mutations.run(async () => {
+      routing.groups = routing.groups.filter((group) => group.id !== id);
+      send(response, 200, { groups: routing.groups });
+      websocket.broadcast(status);
+    });
     return;
   }
   if (request.method === "PUT" && path.match(/^\/v1\/speakers\/[^/]+\/dsp$/)) {
     const speakerId = path.split("/")[3];
-    collectJson(request, (body) => {
+    collectJson(request, response, (body) => {
       if (!isDspProfile(body)) {
         send(response, 400, { error: "invalid DSP profile" });
         return;
       }
-      void (speakerId === status.config.nodeId ? runtime.setVolume(Math.pow(10, body.gainDb / 20)) : Promise.resolve())
-        .then(() => {
+      if (body.gainDb > 0 || body.delayMs !== 0 || body.eq.length !== 0) {
+        send(response, 422, { error: "only gain attenuation is supported by the audio runtime" });
+        return;
+      }
+      void mutations.run(async () => {
+        if (speakerId === status.config.nodeId) {
+          await runtime.setVolume(Math.pow(10, body.gainDb / 20));
+          status.volume = Math.pow(10, body.gainDb / 20);
+        }
           routing.dsp[speakerId] = body;
           send(response, 200, body);
           websocket.broadcast(status);
-        }).catch((error: unknown) => send(response, 409, { error: errorMessage(error) }));
+      }).catch((error: unknown) => send(response, 409, { error: errorMessage(error) }));
     });
     return;
   }
   if (request.method === "POST" && path === "/v1/unsubscribe") {
-    void runtime.unsubscribe().then(() => discovery.withdraw()).then(() => {
-      status.subscription.active = false;
-      status.stream = "stopped";
-      status.health.streamRunning = false;
+    void mutations.run(async () => {
+      await deactivateSubscription(status, runtime, discovery);
       send(response, 200, snapshot(status));
       websocket.broadcast(status);
     }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
@@ -336,12 +499,13 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     return;
   }
   if (request.method === "PUT" && path === "/v1/volume") {
-    collectJson(request, (body) => {
+    collectJson(request, response, (body) => {
       if (!isVolumeRequest(body)) {
         send(response, 400, { error: "volume must be a number from 0 to 1" });
         return;
       }
-      void runtime.setVolume(body.volume).then(() => {
+      void mutations.run(async () => {
+        await runtime.setVolume(body.volume);
         status.volume = body.volume;
         send(response, 200, { volume: status.volume });
         websocket.broadcast(status);
@@ -352,11 +516,25 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
   send(response, 404, { error: "not found" });
 }
 
-function collectJson(request: IncomingMessage, callback: (body: unknown) => void): void {
+function collectJson(request: IncomingMessage, response: ServerResponse,
+                    callback: (body: unknown) => void): void {
   let content = "";
+  let size = 0;
+  let tooLarge = false;
   request.setEncoding("utf8");
-  request.on("data", (chunk: string) => { content += chunk; });
+  request.on("data", (chunk: string) => {
+    size += Buffer.byteLength(chunk);
+    if (size > maxRequestBytes) {
+      tooLarge = true;
+      return;
+    }
+    content += chunk;
+  });
   request.on("end", () => {
+    if (tooLarge) {
+      send(response, 413, { error: "request body is too large" });
+      return;
+    }
     try { callback(JSON.parse(content)); } catch { callback(undefined); }
   });
 }
@@ -364,16 +542,25 @@ function collectJson(request: IncomingMessage, callback: (body: unknown) => void
 function isNodeConfig(value: unknown): value is NodeConfig {
   if (typeof value !== "object" || value === null) return false;
   const config = value as Record<string, unknown>;
-  return typeof config.nodeId === "string" && typeof config.channelCount === "number" &&
-    Number.isInteger(config.channelCount) && config.channelCount > 0 &&
-    typeof config.destination === "string" && typeof config.destinationPort === "number" &&
+  return isNodeId(config.nodeId) && typeof config.channelCount === "number" &&
+    Number.isInteger(config.channelCount) && config.channelCount === 2 &&
+    typeof config.payloadType === "number" && Number.isInteger(config.payloadType) &&
+    config.payloadType >= 96 && config.payloadType <= 127 &&
+    isDestination(config.destination) && typeof config.destinationPort === "number" &&
     Number.isInteger(config.destinationPort) && config.destinationPort > 0 && config.destinationPort < 65536;
+}
+
+function isRoutingState(value: unknown): value is RoutingState {
+  if (typeof value !== "object" || value === null) return false;
+  const routing = value as Record<string, unknown>;
+  return Array.isArray(routing.groups) && typeof routing.dsp === "object" && routing.dsp !== null &&
+    typeof routing.routes === "object" && routing.routes !== null;
 }
 
 function isSubscriptionRequest(value: unknown): value is Partial<NodeConfig> {
   if (typeof value !== "object" || value === null) return false;
   const request = value as Record<string, unknown>;
-  return (request.destination === undefined || typeof request.destination === "string") &&
+  return (request.destination === undefined || isDestination(request.destination)) &&
     (request.destinationPort === undefined || (typeof request.destinationPort === "number" &&
       Number.isInteger(request.destinationPort) && request.destinationPort > 0 && request.destinationPort < 65536));
 }
@@ -391,14 +578,24 @@ function isRouteRequest(value: unknown): value is { streamId: string } {
 function isRouteMatrix(value: unknown): value is { streamId: string; speakerIds: string[] } {
   if (!isRouteRequest(value)) return false;
   const speakerIds = (value as Record<string, unknown>).speakerIds;
-  return Array.isArray(speakerIds) && speakerIds.every((speaker: unknown) => typeof speaker === "string");
+  return Array.isArray(speakerIds) && speakerIds.length > 0 &&
+    speakerIds.every((speaker: unknown) => isNodeId(speaker)) && new Set(speakerIds).size === speakerIds.length;
 }
 
 function isSpeakerGroup(value: unknown): value is SpeakerGroup {
   if (typeof value !== "object" || value === null) return false;
   const group = value as Record<string, unknown>;
   return typeof group.id === "string" && group.id.length > 0 && typeof group.name === "string" &&
-    Array.isArray(group.speakerIds) && group.speakerIds.every((speaker) => typeof speaker === "string");
+    Array.isArray(group.speakerIds) && group.speakerIds.every((speaker) => isNodeId(speaker)) &&
+    new Set(group.speakerIds).size === group.speakerIds.length;
+}
+
+function isNodeId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-zA-Z0-9_.-]{1,64}$/.test(value);
+}
+
+function isDestination(value: unknown): value is string {
+  return typeof value === "string" && isIPv4(value) && value !== "0.0.0.0";
 }
 
 function isDspProfile(value: unknown): value is DspProfile {
@@ -431,6 +628,11 @@ class NoopDiscoveryPublisher implements DiscoveryPublisher {
 }
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
+  if (typeof body === "object" && body !== null && "error" in body) {
+    const operationId = randomUUID();
+    console.error(`[${operationId}] ${JSON.stringify(body)}`);
+    body = { ...body, operationId };
+  }
   response.statusCode = statusCode;
   response.end(JSON.stringify(body));
 }
@@ -440,10 +642,13 @@ class WebSocketHub {
   private readonly buffers = new Map<Duplex, Buffer>();
 
   public constructor(private readonly status: NodeStatus, private readonly runtime: SpeakerRuntime,
-                     private readonly discovery: DiscoveryPublisher) {}
+                     private readonly discovery: DiscoveryPublisher,
+                     private readonly mutations: MutationQueue,
+                     private readonly persist: () => void) {}
 
   public accept(request: IncomingMessage, socket: Duplex): void {
-    if (request.url !== "/v1/events" || request.headers.upgrade?.toLowerCase() !== "websocket") {
+    if (request.url !== "/v1/events" || request.headers.upgrade?.toLowerCase() !== "websocket" ||
+        request.headers["sec-websocket-version"] !== "13") {
       socket.destroy();
       return;
     }
@@ -465,6 +670,7 @@ class WebSocketHub {
   }
 
   public broadcast(status: NodeStatus): void {
+    this.persist();
     for (const client of this.clients) this.send(client, { type: "status", data: snapshot(status) });
   }
 
@@ -476,19 +682,41 @@ class WebSocketHub {
 
   private receive(socket: Duplex, data: Buffer): void {
     const buffered = Buffer.concat([this.buffers.get(socket) ?? Buffer.alloc(0), data]);
+    if (buffered.length > maxWebSocketPayload + 14) {
+      socket.destroy();
+      return;
+    }
     this.buffers.set(socket, buffered);
     const frameData = buffered;
     let offset = 0;
     while (offset + 2 <= frameData.length) {
       const first = frameData[offset];
       const second = frameData[offset + 1];
+      const fin = (first & 0x80) !== 0;
+      const opcode = first & 0x0f;
+      const isControl = opcode >= 0x8;
+      if ((first & 0x70) !== 0 || opcode === 0x0 || (opcode !== 0x1 && opcode !== 0x8 && opcode !== 0x9 && opcode !== 0xa) ||
+          (!fin && (isControl || opcode === 0x1)) || (isControl && (second & 0x7f) > 125) || !(second & 0x80)) {
+        socket.destroy();
+        return;
+      }
       let length = second & 0x7f;
       let headerLength = 2;
       if (length === 126) {
         if (offset + 4 > frameData.length) return;
         length = frameData.readUInt16BE(offset + 2);
         headerLength = 4;
-      } else if (length === 127 || !(second & 0x80)) {
+      } else if (length === 127) {
+        if (offset + 10 > frameData.length) return;
+        const extendedLength = frameData.readBigUInt64BE(offset + 2);
+        if (extendedLength > BigInt(maxWebSocketPayload)) {
+          socket.destroy();
+          return;
+        }
+        length = Number(extendedLength);
+        headerLength = 10;
+      }
+      if (length > maxWebSocketPayload || (opcode === 0x8 && length === 1)) {
         socket.destroy();
         return;
       }
@@ -498,7 +726,6 @@ class WebSocketHub {
       const decoded = Buffer.from(payload);
       for (let index = 0; index < decoded.length; ++index) decoded[index] ^= mask[index % 4];
       offset += headerLength + 4 + length;
-      const opcode = first & 0x0f;
       if (opcode === 0x8) {
         socket.end();
         return;
@@ -515,32 +742,38 @@ class WebSocketHub {
   private async handleCommand(socket: Duplex, text: string): Promise<void> {
     try {
       const command = JSON.parse(text) as { action?: string; destination?: string; destinationPort?: number; volume?: number };
-      if (command.action === "subscribe" && isSubscriptionRequest(command)) {
-        if (command.destination !== undefined) this.status.config.destination = command.destination;
-        if (command.destinationPort !== undefined) this.status.config.destinationPort = command.destinationPort;
-        await this.runtime.subscribe(this.status.config);
-        await this.discovery.publish(this.status.config);
-        this.status.subscription = { active: true, destination: this.status.config.destination,
-          destinationPort: this.status.config.destinationPort };
-        this.status.stream = "running";
-        this.status.health.streamRunning = true;
-        this.broadcast(this.status);
-      } else if (command.action === "unsubscribe") {
-        await this.runtime.unsubscribe();
-        await this.discovery.withdraw();
-        this.status.subscription.active = false;
-        this.status.stream = "stopped";
-        this.status.health.streamRunning = false;
-        this.broadcast(this.status);
-      } else if (command.action === "setVolume" && isVolumeRequest(command)) {
-        await this.runtime.setVolume(command.volume);
-        this.status.volume = command.volume;
-        this.broadcast(this.status);
-      } else if (command.action === "status") {
+      if (command.action === "status") {
         this.send(socket, { type: "status", data: snapshot(this.status) });
-      } else {
-        this.send(socket, { type: "error", error: "invalid WebSocket command" });
+        return;
       }
+      if (command.action === "subscribe" && !isSubscriptionRequest(command)) {
+        this.send(socket, { type: "error", error: "invalid subscription" });
+        return;
+      }
+      if (command.action === "setVolume" && !isVolumeRequest(command)) {
+        this.send(socket, { type: "error", error: "volume must be a number from 0 to 1" });
+        return;
+      }
+      await this.mutations.run(async () => {
+        if (command.action === "subscribe") {
+          const proposed = { ...this.status.config,
+            ...(command.destination === undefined ? {} : { destination: command.destination }),
+            ...(command.destinationPort === undefined ? {} : { destinationPort: command.destinationPort }),
+          };
+          await activateSubscription(proposed, this.status, this.runtime, this.discovery);
+          this.status.config = proposed;
+          this.broadcast(this.status);
+        } else if (command.action === "unsubscribe") {
+          await deactivateSubscription(this.status, this.runtime, this.discovery);
+          this.broadcast(this.status);
+        } else if (command.action === "setVolume") {
+          await this.runtime.setVolume(command.volume!);
+          this.status.volume = command.volume!;
+          this.broadcast(this.status);
+        } else {
+          this.send(socket, { type: "error", error: "invalid WebSocket command" });
+        }
+      });
     } catch (error: unknown) {
       this.send(socket, { type: "error", error: errorMessage(error) });
     }
@@ -551,12 +784,22 @@ class WebSocketHub {
   }
 
   private sendFrame(socket: Duplex, opcode: number, payload: Buffer): void {
+    if (payload.length > maxWebSocketPayload) {
+      socket.destroy();
+      return;
+    }
     if (payload.length >= 126) {
-      const frame = Buffer.alloc(4 + payload.length);
+      const headerLength = payload.length <= 0xffff ? 4 : 10;
+      const frame = Buffer.alloc(headerLength + payload.length);
       frame[0] = 0x80 | opcode;
-      frame[1] = 126;
-      frame.writeUInt16BE(payload.length, 2);
-      payload.copy(frame, 4);
+      if (headerLength === 4) {
+        frame[1] = 126;
+        frame.writeUInt16BE(payload.length, 2);
+      } else {
+        frame[1] = 127;
+        frame.writeBigUInt64BE(BigInt(payload.length), 2);
+      }
+      payload.copy(frame, headerLength);
       socket.write(frame);
       return;
     }

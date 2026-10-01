@@ -26,6 +26,7 @@ public:
     std::optional<std::uint32_t> next_timestamp() const noexcept;
     std::optional<std::uint32_t> last_timestamp() const noexcept;
     std::size_t buffered_packets() const noexcept;
+    std::uint64_t sequence_gaps() const noexcept;
 
 private:
     AudioFormat format_;
@@ -33,6 +34,9 @@ private:
     JitterBuffer jitter_buffer_;
     bool primed_ = false;
     std::optional<std::uint32_t> last_timestamp_;
+    std::optional<std::uint32_t> source_ssrc_;
+    std::optional<std::uint16_t> last_sequence_;
+    std::uint64_t sequence_gaps_ = 0;
 };
 
 }  // namespace aes67

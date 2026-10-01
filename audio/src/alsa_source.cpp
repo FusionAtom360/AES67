@@ -54,16 +54,26 @@ AudioPacket AlsaSource::read_packet(std::uint32_t rtp_timestamp) {
     constexpr std::size_t channels = 2;
     std::vector<std::uint8_t> pcm(frames_per_packet * channels * 3);
     std::size_t frames_read = 0;
+    std::size_t recovery_attempts = 0;
     while (frames_read < frames_per_packet) {
         auto* data = pcm.data() + frames_read * channels * 3;
         const auto frames = snd_pcm_readi(impl_->handle, data, frames_per_packet - frames_read);
-        if (frames == -EPIPE) {
-            snd_pcm_prepare(impl_->handle);
+        if (frames < 0) {
+            if (++recovery_attempts > 3) {
+                throw std::runtime_error("ALSA capture recovery failed: " +
+                                         std::string(snd_strerror(static_cast<int>(frames))));
+            }
+            const auto recovered = snd_pcm_recover(impl_->handle, static_cast<int>(frames), 1);
+            if (recovered < 0) {
+                throw std::runtime_error("ALSA capture failed: " +
+                                         std::string(snd_strerror(recovered)));
+            }
             continue;
         }
-        if (frames < 0) {
-            throw std::runtime_error("ALSA capture failed: " + std::string(snd_strerror(static_cast<int>(frames))));
+        if (frames == 0) {
+            throw std::runtime_error("ALSA capture returned zero frames");
         }
+        recovery_attempts = 0;
         frames_read += static_cast<std::size_t>(frames);
     }
 

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { createSocket, type Socket } from "node:dgram";
+import { isIPv4 } from "node:net";
 import type { NodeConfig } from "./index.js";
 
 export interface DiscoveredStream {
@@ -118,22 +119,28 @@ export class SapRegistry implements DiscoveryRegistry {
 }
 
 export function parseSapAnnouncement(message: Buffer, sourceAddress: string): DiscoveredStream | undefined {
-    if (message.length < 8) return undefined;
+  if (message.length < 8 || (message[0] & 0xe0) !== 0x20 || (message[0] & 0x10) !== 0 ||
+    !isIPv4(sourceAddress)) return undefined;
     const messageId = message.readUInt16BE(2).toString(16).padStart(4, "0");
     const separator = message.indexOf(0, 8);
     if (separator < 0 || message.subarray(8, separator).toString("ascii") !== "application/sdp") return undefined;
     const sdp = message.subarray(separator + 1).toString("utf8");
+    if (lineValue(sdp, "v") !== "0" || !lineValue(sdp, "o") || !lineValue(sdp, "t") ||
+      lineValue(sdp, "a", "ts-refclk:") !== "ptp=IEEE1588-2008:0" ||
+      lineValue(sdp, "a", "mediaclk:") !== "direct=0") return undefined;
     const sessionName = lineValue(sdp, "s");
-    const connection = lineValue(sdp, "c").split(" ");
-    const media = lineValue(sdp, "m").split(" ");
-    const rtpmap = lineValue(sdp, "a", "rtpmap:").split(" ");
+    const connection = lineValue(sdp, "c").split(/\s+/);
+    const media = lineValue(sdp, "m").split(/\s+/);
+    const rtpmap = lineValue(sdp, "a", "rtpmap:").split(/\s+/);
     const codec = rtpmap[1]?.split("/");
     const port = Number(media[1]);
     const payloadType = Number(media[3]);
-    const channels = Number(codec?.[2] ?? 1);
-    if (!sessionName || connection.length !== 3 || connection[2] === undefined ||
-        media[0] !== "audio" || !Number.isInteger(port) || port <= 0 || port >= 65536 ||
-        !Number.isInteger(payloadType) || !Number.isInteger(channels)) return undefined;
+    const channels = Number(codec?.[2]);
+    if (!sessionName || connection.length !== 3 || connection[0] !== "IN" || connection[1] !== "IP4" ||
+      connection[2] === undefined || !isIPv4(connection[2]) || media.length !== 4 ||
+      media[0] !== "audio" || media[2] !== "RTP/AVP" || !Number.isInteger(port) || port <= 0 || port >= 65536 ||
+      !Number.isInteger(payloadType) || payloadType < 96 || payloadType > 127 ||
+      rtpmap[0] !== String(payloadType) || codec?.[0] !== "L24" || codec?.[1] !== "48000" || channels !== 2) return undefined;
     const id = `${sourceAddress}-${messageId}`;
       return {
       id,
@@ -160,8 +167,8 @@ function createSdp(config: NodeConfig): string {
     `c=IN IP4 ${config.destination}`,
     "t=0 0",
     "a=ts-refclk:ptp=IEEE1588-2008:0",
-    `m=audio ${config.destinationPort} RTP/AVP 96`,
-    `a=rtpmap:96 L24/48000/${config.channelCount}`,
+    `m=audio ${config.destinationPort} RTP/AVP ${config.payloadType}`,
+    `a=rtpmap:${config.payloadType} L24/48000/${config.channelCount}`,
     "a=mediaclk:direct=0",
     "",
   ].join("\r\n");

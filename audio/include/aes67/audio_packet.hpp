@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace aes67 {
@@ -13,7 +14,11 @@ struct AudioFormat {
     static constexpr std::uint16_t packet_duration_ms = 1;
     static constexpr std::uint32_t samples_per_packet = sample_rate / 1'000;
 
-    std::uint16_t channels = 2;
+    explicit AudioFormat(std::uint16_t channel_count = 2) : channels(channel_count) {
+        if (channels != 2) throw std::invalid_argument("AES67 audio runtime requires exactly two channels");
+    }
+
+    std::uint16_t channels;
 };
 
 struct AudioPacket {

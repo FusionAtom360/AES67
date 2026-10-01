@@ -3,6 +3,13 @@
 #include <stdexcept>
 
 namespace aes67 {
+namespace {
+
+bool is_before(std::uint32_t left, std::uint32_t right) {
+    return static_cast<std::uint32_t>(left - right) >= 0x8000'0000U;
+}
+
+}  // namespace
 
 JitterBuffer::JitterBuffer(std::size_t capacity_packets)
     : capacity_packets_(capacity_packets) {
@@ -12,7 +19,7 @@ JitterBuffer::JitterBuffer(std::size_t capacity_packets)
 }
 
 bool JitterBuffer::push(AudioPacket packet) {
-    if (next_timestamp_.has_value() && packet.rtp_timestamp < *next_timestamp_) {
+    if (next_timestamp_.has_value() && is_before(packet.rtp_timestamp, *next_timestamp_)) {
         return false;
     }
     if (packets_.size() >= capacity_packets_ && !packets_.contains(packet.rtp_timestamp)) {

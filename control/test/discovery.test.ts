@@ -5,7 +5,8 @@ import { parseSapAnnouncement } from "../src/discovery.js";
 test("SAP parser extracts an AES67 stream", () => {
   const sdp = [
     "v=0", "o=- 1 1 IN IP4 0.0.0.0", "s=Lab source", "c=IN IP4 239.69.0.1",
-    "t=0 0", "m=audio 5004 RTP/AVP 96", "a=rtpmap:96 L24/48000/2", "",
+    "t=0 0", "a=ts-refclk:ptp=IEEE1588-2008:0", "m=audio 5004 RTP/AVP 96",
+    "a=rtpmap:96 L24/48000/2", "a=mediaclk:direct=0", "",
   ].join("\r\n");
   const packet = Buffer.concat([Buffer.from([0x20, 0, 0x12, 0x34, 0, 0, 0, 0]),
     Buffer.from("application/sdp\0"), Buffer.from(sdp)]);
@@ -13,6 +14,15 @@ test("SAP parser extracts an AES67 stream", () => {
   assert.equal(stream?.id, "192.0.2.10-1234");
   assert.equal(stream?.destinationPort, 5004);
   assert.equal(stream?.channelCount, 2);
+  assert.equal(parseSapAnnouncement(packet, "2001:db8::10"), undefined);
+  const unsupportedCodec = sdp.replace("L24/48000/2", "PCMU/8000/2");
+  const unsupportedPacket = Buffer.concat([Buffer.from([0x20, 0, 0x12, 0x34, 0, 0, 0, 0]),
+    Buffer.from("application/sdp\0"), Buffer.from(unsupportedCodec)]);
+  assert.equal(parseSapAnnouncement(unsupportedPacket, "192.0.2.10"), undefined);
+  const missingClock = sdp.replace("a=mediaclk:direct=0\r\n", "");
+  const missingClockPacket = Buffer.concat([Buffer.from([0x20, 0, 0x12, 0x34, 0, 0, 0, 0]),
+    Buffer.from("application/sdp\0"), Buffer.from(missingClock)]);
+  assert.equal(parseSapAnnouncement(missingClockPacket, "192.0.2.10"), undefined);
 });
 
 test("SAP parser rejects malformed payloads", () => {

@@ -9,8 +9,14 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
+
+#undef assert
+#define assert(condition) do { \
+    if (!(condition)) throw std::runtime_error("test assertion failed: " #condition); \
+} while (false)
 
 std::vector<std::uint8_t> make_rtp(std::uint16_t sequence, std::uint32_t timestamp,
                                    std::uint32_t ssrc, std::span<const std::uint8_t> payload) {
@@ -72,10 +78,40 @@ int main() {
 
     aes67::ReceivePath receive_path(format);
     receive_path.prime(48'000);
-    assert(receive_path.ingest(second_datagram));
     assert(receive_path.ingest(first_datagram));
+    assert(receive_path.ingest(second_datagram));
     assert(receive_path.buffered_packets() == 2);
     assert(!receive_path.ingest(first_datagram));
+    assert(receive_path.sequence_gaps() == 0);
+
+    auto gap_datagram = make_rtp(10, 48'096, 0x12345678, second_payload);
+    assert(receive_path.ingest(gap_datagram));
+    assert(receive_path.sequence_gaps() == 1);
+
+    auto other_source = make_rtp(11, 48'144, 0x87654321, second_payload);
+    assert(!receive_path.ingest(other_source));
+    assert(receive_path.sequence_gaps() == 1);
+
+    aes67::JitterBuffer wrapped_buffer;
+    const auto wrapped_timestamp = std::numeric_limits<std::uint32_t>::max() - 15;
+    wrapped_buffer.prime(wrapped_timestamp);
+    assert(wrapped_buffer.push(AudioPacket{format, wrapped_timestamp, source.samples}));
+    assert(wrapped_buffer.push(AudioPacket{format, 32, source.samples}));
+    assert(wrapped_buffer.pop_next().has_value());
+    assert(wrapped_buffer.pop_next().has_value());
+
+    aes67::ReceivePath malformed_path(format);
+    auto malformed_datagram = first_datagram;
+    malformed_datagram.resize(12 + 3);
+    bool rejected_malformed_payload = false;
+    try {
+        malformed_path.ingest(malformed_datagram);
+    } catch (const std::invalid_argument&) {
+        rejected_malformed_payload = true;
+    }
+    assert(rejected_malformed_payload);
+    assert(!malformed_path.next_timestamp().has_value());
+    assert(malformed_path.ingest(first_datagram));
 
     aes67::ReceivePath auto_primed_path(format);
     assert(auto_primed_path.ingest(first_datagram));
@@ -92,6 +128,8 @@ int main() {
     assert(playout.output_samples(20) == 48);
     playout.observe_packet(48'048, 1'001'000'000);
     assert(playout.clock_ratio() > 0.99 && playout.clock_ratio() < 1.01);
+    playout.observe_packet(48'096, 900'000'000);
+    assert(playout.due_time_ns(48'096, 900'000'000) == 920'000'000);
 
     aes67::PlayoutController absolute_playout({48'000, 48, 20, 20, true});
     absolute_playout.observe_packet(48'000, 1'000'000'000);
@@ -130,6 +168,17 @@ int main() {
     assert(parsed_sdp.encoding_name == "L24");
     assert(parsed_sdp.clock_rate == 48000);
     assert(parsed_sdp.channels == 2);
+
+    auto mono_sdp = sdp;
+    const auto channel_map = mono_sdp.find("L24/48000/2");
+    mono_sdp.replace(channel_map, std::string("L24/48000/1").size(), "L24/48000/1");
+    bool rejected_mono_sdp = false;
+    try {
+        aes67::SdpSession::parse(mono_sdp);
+    } catch (const std::invalid_argument&) {
+        rejected_mono_sdp = true;
+    }
+    assert(rejected_mono_sdp);
 
     auto unsynchronized_sdp = sdp;
     const auto clock_attribute = unsynchronized_sdp.find("a=ts-refclk");

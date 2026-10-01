@@ -10,11 +10,18 @@ class FakeRuntime implements SpeakerRuntime {
   public running = false;
   public volume = 1;
   public lastConfig: NodeConfig | undefined;
+  private readonly listeners = new Set<() => void>();
 
-  public async subscribe(config: NodeConfig): Promise<void> { this.running = true; this.lastConfig = config; }
-  public async unsubscribe(): Promise<void> { this.running = false; }
+  public async subscribe(config: NodeConfig): Promise<void> { this.running = true; this.lastConfig = config; this.notify(); }
+  public async unsubscribe(): Promise<void> { this.running = false; this.notify(); }
   public async setVolume(volume: number): Promise<void> { this.volume = volume; }
   public isRunning(): boolean { return this.running; }
+  public onStateChange(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  public exit(): void { this.running = false; this.notify(); }
+  private notify(): void { for (const listener of this.listeners) listener(); }
 }
 
 class FakeDiscovery implements DiscoveryPublisher {
@@ -61,6 +68,7 @@ test("control plane reports the pinned profile and accepts configuration", async
   const updated = await call(address.port, "PUT", "/v1/config", {
     nodeId: "stage-left",
     channelCount: 2,
+    payloadType: 97,
     destination: "239.69.0.2",
     destinationPort: 5004,
   });
@@ -70,6 +78,7 @@ test("control plane reports the pinned profile and accepts configuration", async
   const health = await call(address.port, "GET", "/health");
   assert.equal(health.statusCode, 200);
   assert.equal((health.body as { ok: boolean }).ok, true);
+  assert.equal((health.body as { discoveryAvailable: boolean }).discoveryAvailable, true);
   const discovered = await call(address.port, "GET", "/v1/discovery/streams");
   assert.equal((discovered.body as { streams: Array<{ id: string }> }).streams[0]?.id, "sender-1");
   const routing = await call(address.port, "GET", "/v1/routing");
@@ -83,6 +92,24 @@ test("control plane reports the pinned profile and accepts configuration", async
   assert.equal((subscribed.body as { subscription: { active: boolean } }).subscription.active, true);
   assert.equal((subscribed.body as { stream: string }).stream, "running");
   assert.equal(discovery.active, true);
+
+  const liveConfig = await call(address.port, "PUT", "/v1/config", {
+    nodeId: "stage-left",
+    channelCount: 2,
+    payloadType: 98,
+    destination: "239.69.0.3",
+    destinationPort: 5007,
+  });
+  assert.equal(liveConfig.statusCode, 200);
+  assert.equal(runtime.lastConfig?.destination, "239.69.0.3");
+  assert.equal(runtime.lastConfig?.payloadType, 98);
+
+  runtime.exit();
+  const failedHealth = await call(address.port, "GET", "/health");
+  assert.equal((failedHealth.body as { ok: boolean }).ok, false);
+  assert.equal((failedHealth.body as { streamRunning: boolean }).streamRunning, false);
+  const failedStatus = await call(address.port, "GET", "/v1/status");
+  assert.equal((failedStatus.body as { stream: string }).stream, "stopped");
 
   const volume = await call(address.port, "PUT", "/v1/volume", { volume: 0.65 });
   assert.equal(volume.statusCode, 200);
@@ -101,16 +128,26 @@ test("control plane reports the pinned profile and accepts configuration", async
     id: "front", name: "Front wall", speakerIds: ["stage-left"],
   });
   assert.equal(group.statusCode, 200);
-  const dsp = await call(address.port, "PUT", "/v1/speakers/stage-left/dsp", {
+  const unsupportedDsp = await call(address.port, "PUT", "/v1/speakers/stage-left/dsp", {
     gainDb: -3, delayMs: 2.5, eq: [{ frequencyHz: 1000, gainDb: 2, q: 1 }],
+  });
+  assert.equal(unsupportedDsp.statusCode, 422);
+  const dsp = await call(address.port, "PUT", "/v1/speakers/stage-left/dsp", {
+    gainDb: -3, delayMs: 0, eq: [],
   });
   assert.equal(dsp.statusCode, 200);
 
   const websocket = await openWebSocket(address.port);
   assert.match(websocket, /HTTP\/1\.1 101 Switching Protocols/);
   assert.match(websocket, /"type":"status"/);
-  server.close();
+  await closeServer(server);
 });
+
+function closeServer(server: ReturnType<typeof createControlServer>): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    server.close((error) => error === undefined ? resolvePromise() : reject(error));
+  });
+}
 
 async function openWebSocket(port: number): Promise<string> {
   const client = connect(port, "127.0.0.1");
@@ -119,7 +156,8 @@ async function openWebSocket(port: number): Promise<string> {
     "Host: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
     "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC1rZXk=\r\n\r\n");
   const [data] = await once(client, "data") as [Buffer];
-  client.destroy();
+  client.write(Buffer.from([0x88, 0x80, 0x01, 0x02, 0x03, 0x04]));
+  await once(client, "close");
   return data.toString("utf8");
 }
 

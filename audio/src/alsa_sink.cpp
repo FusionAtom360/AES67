@@ -69,15 +69,25 @@ void AlsaSink::write(const AudioPacket& packet) {
     }
     auto frames_remaining = static_cast<snd_pcm_sframes_t>(packet.samples.size() / 2);
     auto* data = pcm.data();
+    std::size_t recovery_attempts = 0;
     while (frames_remaining > 0) {
         const auto frames_written = snd_pcm_writei(impl_->handle, data, frames_remaining);
-        if (frames_written == -EPIPE) {
-            snd_pcm_prepare(impl_->handle);
+        if (frames_written < 0) {
+            if (++recovery_attempts > 3) {
+                throw std::runtime_error("ALSA playback recovery failed: " +
+                                         std::string(snd_strerror(static_cast<int>(frames_written))));
+            }
+            const auto recovered = snd_pcm_recover(impl_->handle, static_cast<int>(frames_written), 1);
+            if (recovered < 0) {
+                throw std::runtime_error("ALSA playback failed: " +
+                                         std::string(snd_strerror(recovered)));
+            }
             continue;
         }
-        if (frames_written < 0) {
-            throw std::runtime_error("ALSA playback failed: " + std::string(snd_strerror(static_cast<int>(frames_written))));
+        if (frames_written == 0) {
+            throw std::runtime_error("ALSA playback returned zero frames");
         }
+        recovery_attempts = 0;
         frames_remaining -= frames_written;
         data += frames_written * 2 * 3;
     }
