@@ -111,10 +111,17 @@ export class SapRegistry implements DiscoveryRegistry {
   }
 
   private receive(message: Buffer, sourceAddress: string): void {
-    if (message.length < 8) return;
+    const stream = parseSapAnnouncement(message, sourceAddress);
+    if (stream === undefined) return;
+    this.streams.set(stream.id, stream);
+  }
+}
+
+export function parseSapAnnouncement(message: Buffer, sourceAddress: string): DiscoveredStream | undefined {
+    if (message.length < 8) return undefined;
     const messageId = message.readUInt16BE(2).toString(16).padStart(4, "0");
     const separator = message.indexOf(0, 8);
-    if (separator < 0 || message.subarray(8, separator).toString("ascii") !== "application/sdp") return;
+    if (separator < 0 || message.subarray(8, separator).toString("ascii") !== "application/sdp") return undefined;
     const sdp = message.subarray(separator + 1).toString("utf8");
     const sessionName = lineValue(sdp, "s");
     const connection = lineValue(sdp, "c").split(" ");
@@ -126,9 +133,9 @@ export class SapRegistry implements DiscoveryRegistry {
     const channels = Number(codec?.[2] ?? 1);
     if (!sessionName || connection.length !== 3 || connection[2] === undefined ||
         media[0] !== "audio" || !Number.isInteger(port) || port <= 0 || port >= 65536 ||
-        !Number.isInteger(payloadType) || !Number.isInteger(channels)) return;
+        !Number.isInteger(payloadType) || !Number.isInteger(channels)) return undefined;
     const id = `${sourceAddress}-${messageId}`;
-    this.streams.set(id, {
+      return {
       id,
       sourceAddress,
       sessionName,
@@ -137,8 +144,7 @@ export class SapRegistry implements DiscoveryRegistry {
       channelCount: channels,
       payloadType,
       lastSeen: new Date().toISOString(),
-    });
-  }
+    };
 }
 
 function lineValue(sdp: string, type: string, prefix = ""): string {

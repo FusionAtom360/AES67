@@ -105,6 +105,16 @@ int main() {
     }
     assert(rejected_short_rtp);
 
+    auto wrong_payload_type = first_datagram;
+    wrong_payload_type[1] = 95;
+    bool rejected_wrong_payload_type = false;
+    try {
+        aes67::ReceivePath(format, 96).ingest(wrong_payload_type);
+    } catch (const std::invalid_argument&) {
+        rejected_wrong_payload_type = true;
+    }
+    assert(rejected_wrong_payload_type);
+
     aes67::SdpSession session;
     session.session_name = "Studio monitor";
     session.connection_address = "239.69.0.1";
@@ -120,6 +130,17 @@ int main() {
     assert(parsed_sdp.encoding_name == "L24");
     assert(parsed_sdp.clock_rate == 48000);
     assert(parsed_sdp.channels == 2);
+
+    auto unsynchronized_sdp = sdp;
+    const auto clock_attribute = unsynchronized_sdp.find("a=ts-refclk");
+    unsynchronized_sdp.erase(clock_attribute, unsynchronized_sdp.find("\r\n", clock_attribute) - clock_attribute + 2);
+    bool rejected_unsynchronized_sdp = false;
+    try {
+        aes67::SdpSession::parse(unsynchronized_sdp);
+    } catch (const std::invalid_argument&) {
+        rejected_unsynchronized_sdp = true;
+    }
+    assert(rejected_unsynchronized_sdp);
 
     bool rejected_incomplete_sdp = false;
     try {
