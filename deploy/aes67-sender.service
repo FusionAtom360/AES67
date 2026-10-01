@@ -1,0 +1,24 @@
+[Unit]
+Description=AES67 ALSA capture RTP sender
+After=network-online.target ptp4l.service phc2sys.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aes67
+Group=audio
+WorkingDirectory=/opt/aes67/current
+EnvironmentFile=-/etc/aes67/aes67.env
+ExecStart=/opt/aes67/current/build/aes67_sender_node --device ${AES67_ALSA_CAPTURE_DEVICE} --destination ${AES67_DESTINATION} --port ${AES67_DESTINATION_PORT} --interface ${AES67_MEDIA_INTERFACE} --sdp /var/lib/aes67/stream.sdp
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aes67
+
+[Install]
+WantedBy=multi-user.target

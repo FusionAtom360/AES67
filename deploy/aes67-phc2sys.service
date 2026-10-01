@@ -1,0 +1,17 @@
+[Unit]
+Description=Discipline system clock from PTP hardware clock
+Requires=aes67-ptp4l.service
+After=aes67-ptp4l.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=-/etc/aes67/aes67.env
+ExecStart=/usr/sbin/phc2sys -s ${AES67_MEDIA_INTERFACE} -c CLOCK_REALTIME -O 0 -m
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

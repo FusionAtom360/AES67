@@ -21,7 +21,9 @@ namespace aes67 {
 UdpReceiver::UdpReceiver(std::uint16_t port, std::string bind_address)
     : UdpReceiver(UdpReceiverConfig{port, std::move(bind_address)}) {}
 
-UdpReceiver::UdpReceiver(UdpReceiverConfig config) {
+UdpReceiver::UdpReceiver(UdpReceiverConfig config)
+        : multicast_group_(std::move(config.multicast_group)),
+            multicast_interface_(std::move(config.multicast_interface)) {
 #ifdef _WIN32
     (void)config;
     throw std::runtime_error("UDP receiver is not implemented for Windows yet");
@@ -63,17 +65,12 @@ UdpReceiver::UdpReceiver(UdpReceiverConfig config) {
         socket_ = -1;
         throw std::runtime_error(std::string("could not bind UDP socket: ") + std::strerror(errno));
     }
-    if (!config.multicast_group.empty()) {
-        ip_mreq membership{};
-        if (inet_pton(AF_INET, config.multicast_group.c_str(), &membership.imr_multiaddr) != 1 ||
-            inet_pton(AF_INET, config.multicast_interface.c_str(), &membership.imr_interface) != 1 ||
-            !IN_MULTICAST(ntohl(membership.imr_multiaddr.s_addr)) ||
-            ::setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership, sizeof(membership)) < 0) {
+    if (!multicast_group_.empty() && !refresh_multicast_membership()) {
+            const auto error = errno;
             ::close(socket_);
             socket_ = -1;
-            throw std::runtime_error(std::string("could not join multicast group: ") + std::strerror(errno));
+            throw std::runtime_error(std::string("could not join multicast group: ") + std::strerror(error));
         }
-    }
 #endif
 }
 
@@ -93,10 +90,39 @@ bool UdpReceiver::receive_once(ReceivePath& path) {
     std::array<std::uint8_t, 2048> datagram{};
     const auto received = ::recv(socket_, datagram.data(), datagram.size(), 0);
     if (received < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (++idle_receive_ticks_ >= 1'000) {
+                idle_receive_ticks_ = 0;
+                (void)refresh_multicast_membership();
+            }
+            return false;
+        }
+        if (errno == EINTR || errno == ENETDOWN || errno == ENETUNREACH || errno == EHOSTUNREACH ||
+            errno == ENODEV || errno == ENOBUFS || errno == EIO) {
+            (void)refresh_multicast_membership();
+            return false;
+        }
         throw std::runtime_error(std::string("UDP receive failed: ") + std::strerror(errno));
     }
+    idle_receive_ticks_ = 0;
     return path.ingest(std::span<const std::uint8_t>(datagram.data(), static_cast<std::size_t>(received)));
+#endif
+}
+
+bool UdpReceiver::refresh_multicast_membership() noexcept {
+#ifdef _WIN32
+    return true;
+#else
+    if (multicast_group_.empty()) return true;
+    ip_mreq membership{};
+    if (inet_pton(AF_INET, multicast_group_.c_str(), &membership.imr_multiaddr) != 1 ||
+        inet_pton(AF_INET, multicast_interface_.c_str(), &membership.imr_interface) != 1 ||
+        !IN_MULTICAST(ntohl(membership.imr_multiaddr.s_addr))) {
+        return false;
+    }
+    const auto result = ::setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                                     &membership, sizeof(membership));
+    return result == 0 || errno == EADDRINUSE;
 #endif
 }
 

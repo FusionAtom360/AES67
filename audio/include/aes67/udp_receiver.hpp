@@ -29,7 +29,12 @@ public:
     bool receive_once(ReceivePath& path);
 
 private:
+    bool refresh_multicast_membership() noexcept;
+
     int socket_ = -1;
+    std::string multicast_group_;
+    std::string multicast_interface_;
+    std::uint32_t idle_receive_ticks_ = 0;
 };
 
 }  // namespace aes67

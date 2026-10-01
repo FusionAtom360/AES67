@@ -1,0 +1,24 @@
+[Unit]
+Description=AES67 speaker control daemon
+After=network-online.target ptp4l.service phc2sys.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aes67
+Group=aes67
+WorkingDirectory=/opt/aes67/current/control
+EnvironmentFile=-/etc/aes67/aes67.env
+ExecStart=/usr/bin/node /opt/aes67/current/control/dist/src/index.js
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/aes67 /var/lib/aes67
+
+[Install]
+WantedBy=multi-user.target

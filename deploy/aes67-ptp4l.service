@@ -1,0 +1,17 @@
+[Unit]
+Description=PTPv2 linuxptp hardware clock
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=-/etc/aes67/aes67.env
+ExecStart=/usr/sbin/ptp4l -i ${AES67_MEDIA_INTERFACE} -2 -m
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

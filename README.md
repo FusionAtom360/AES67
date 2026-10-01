@@ -115,6 +115,8 @@ The receiver can instead derive the media and network settings from an SDP file:
 
 In SDP mode, the first valid RTP timestamp primes the jitter buffer automatically. The default playout delay is 20 ms and can be changed with `--playout-delay-ms`.
 
+Operational hardening tools, systemd units, latency checks, and atomic OTA update/rollback scripts are documented in [docs/operations.md](docs/operations.md).
+
 ## Profile
 
 See [docs/aes67-profile.md](docs/aes67-profile.md) for the normative choices made by this repository and the items that remain outside this skeleton.

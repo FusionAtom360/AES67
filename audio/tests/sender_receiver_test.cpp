@@ -4,6 +4,7 @@
 #include "aes67/udp_receiver.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 
@@ -18,6 +19,7 @@ int main() {
 
     aes67::UdpReceiver receiver({port, "127.0.0.1", "", "0.0.0.0", false, 1000});
     aes67::RtpSender sender({"127.0.0.1", port, "0.0.0.0", 96, false});
+    const auto send_time = std::chrono::steady_clock::now();
     sender.send(source, 7);
 
     aes67::ReceivePath path(format, 96);
@@ -28,6 +30,9 @@ int main() {
     assert(received.has_value());
     assert(received->rtp_timestamp == source.rtp_timestamp);
     assert(received->samples == source.samples);
+    const auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - send_time).count();
+    assert(latency_us >= 0);
 
-    std::cout << "sender/receiver integration test passed\n";
+    std::cout << "sender/receiver integration test passed; latency_us=" << latency_us << "\n";
 }
