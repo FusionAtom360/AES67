@@ -54,6 +54,9 @@ test("control plane reports the pinned profile and accepts configuration", async
   const status = await call(address.port, "GET", "/v1/status");
   assert.equal(status.statusCode, 200);
   assert.equal((status.body as { profile: string }).profile, "AES67-L24-48k-1ms");
+  const page = await callText(address.port, "GET", "/");
+  assert.equal(page.statusCode, 200);
+  assert.match(page.body, /AES67 Control/);
 
   const updated = await call(address.port, "PUT", "/v1/config", {
     nodeId: "stage-left",
@@ -69,6 +72,8 @@ test("control plane reports the pinned profile and accepts configuration", async
   assert.equal((health.body as { ok: boolean }).ok, true);
   const discovered = await call(address.port, "GET", "/v1/discovery/streams");
   assert.equal((discovered.body as { streams: Array<{ id: string }> }).streams[0]?.id, "sender-1");
+  const routing = await call(address.port, "GET", "/v1/routing");
+  assert.equal((routing.body as { localSpeakerId: string }).localSpeakerId, "stage-left");
 
   const subscribed = await call(address.port, "POST", "/v1/subscribe", {
     destination: "239.69.0.2",
@@ -91,6 +96,15 @@ test("control plane reports the pinned profile and accepts configuration", async
   const routed = await call(address.port, "POST", "/v1/routes", { streamId: "sender-1" });
   assert.equal(routed.statusCode, 200);
   assert.equal(runtime.lastConfig?.destination, "239.69.0.1");
+
+  const group = await call(address.port, "PUT", "/v1/groups/front", {
+    id: "front", name: "Front wall", speakerIds: ["stage-left"],
+  });
+  assert.equal(group.statusCode, 200);
+  const dsp = await call(address.port, "PUT", "/v1/speakers/stage-left/dsp", {
+    gainDb: -3, delayMs: 2.5, eq: [{ frequencyHz: 1000, gainDb: 2, q: 1 }],
+  });
+  assert.equal(dsp.statusCode, 200);
 
   const websocket = await openWebSocket(address.port);
   assert.match(websocket, /HTTP\/1\.1 101 Switching Protocols/);
@@ -122,5 +136,18 @@ function call(port: number, method: string, path: string, body?: unknown): Promi
       });
     clientRequest.on("error", reject);
     if (requestBody !== undefined) clientRequest.end(requestBody); else clientRequest.end();
+  });
+}
+
+function callText(port: number, method: string, path: string): Promise<{ statusCode?: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const clientRequest = request({ hostname: "127.0.0.1", port, method, path }, (response) => {
+      let content = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { content += chunk; });
+      response.on("end", () => resolve({ statusCode: response.statusCode, body: content }));
+    });
+    clientRequest.on("error", reject);
+    clientRequest.end();
   });
 }

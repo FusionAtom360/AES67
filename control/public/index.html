@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AES67 Control</title>
+  <style>
+    :root { --ink:#182326; --muted:#667477; --line:#d6dfde; --paper:#f6f8f4; --panel:#fff; --accent:#0b7771; --accent-2:#d86a3b; --dark:#173c3d; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font:15px/1.45 ui-sans-serif, system-ui, sans-serif; }
+    header { background:var(--dark); color:#f7fbf5; padding:28px 5vw 24px; display:flex; justify-content:space-between; align-items:end; gap:24px; }
+    header h1 { margin:0; font:700 30px/1 Georgia, serif; letter-spacing:0; }
+    header p { margin:5px 0 0; color:#bdd3cc; }
+    .health { display:flex; align-items:center; gap:8px; white-space:nowrap; color:#d9eee3; }
+    .dot { width:10px; height:10px; border-radius:50%; background:#77d69d; }
+    main { max-width:1280px; margin:0 auto; padding:30px 5vw 60px; }
+    .toolbar { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:22px; }
+    h2 { margin:0; font:700 21px/1 Georgia, serif; }
+    button, input, select { font:inherit; }
+    button { border:0; background:var(--accent); color:white; padding:9px 14px; border-radius:4px; cursor:pointer; }
+    button.secondary { background:#e2ebe8; color:var(--dark); }
+    button.warn { background:var(--accent-2); }
+    .layout { display:grid; grid-template-columns:minmax(0, 1fr) 320px; gap:22px; }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:20px; box-shadow:0 5px 18px #173c3d0a; }
+    .matrix { overflow:auto; }
+    table { width:100%; border-collapse:collapse; min-width:540px; }
+    th, td { text-align:left; padding:12px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
+    th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+    .source { font-weight:700; }
+    .source small, .speaker small { display:block; color:var(--muted); font-weight:400; }
+    .toggle { width:22px; height:22px; accent-color:var(--accent); }
+    .stack { display:grid; gap:22px; }
+    label { display:grid; gap:5px; color:var(--muted); font-size:13px; }
+    input[type=text], input[type=number] { width:100%; border:1px solid var(--line); padding:8px 9px; border-radius:4px; color:var(--ink); background:#fbfdfb; }
+    .field-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .bands { display:grid; gap:8px; margin:10px 0; }
+    .band { display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:6px; align-items:end; }
+    .group { display:flex; justify-content:space-between; gap:8px; align-items:center; border-top:1px solid var(--line); padding:10px 0; }
+    .empty { padding:28px 10px; color:var(--muted); text-align:center; }
+    .toast { position:fixed; right:22px; bottom:22px; background:var(--dark); color:white; padding:12px 16px; border-radius:4px; opacity:0; transform:translateY(8px); transition:.2s; pointer-events:none; }
+    .toast.show { opacity:1; transform:none; }
+    @media (max-width:850px) { header { align-items:start; flex-direction:column; } .layout { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>AES67 Control</h1><p>Routing, speaker groups, and per-node DSP</p></div>
+    <div class="health"><span class="dot" id="healthDot"></span><span id="healthText">Checking node</span></div>
+  </header>
+  <main>
+    <div class="toolbar"><h2>Routing matrix</h2><button class="secondary" id="refresh">Refresh</button></div>
+    <div class="layout">
+      <section class="matrix"><table><thead><tr><th>Discovered source</th><th id="localSpeakerHeading">Local speaker</th><th>Format</th></tr></thead><tbody id="matrixBody"></tbody></table></section>
+      <div class="stack">
+        <section><h2>Speaker DSP</h2><p id="selectedSpeaker">Select the local speaker to edit its profile.</p><div id="dspForm"></div></section>
+        <section><h2>Speaker groups</h2><div id="groups"></div><button id="addGroup">Add group</button></section>
+      </div>
+    </div>
+  </main>
+  <div class="toast" id="toast"></div>
+<script>
+  const state = { data:null, selectedSpeaker:null };
+  const $ = (id) => document.getElementById(id);
+  async function api(path, options) { const response = await fetch(path, options); const body = await response.json(); if (!response.ok) throw new Error(body.error || 'Request failed'); return body; }
+  function json(method, body) { return { method, headers:{'content-type':'application/json'}, body:JSON.stringify(body) }; }
+  function toast(message) { const node=$('toast'); node.textContent=message; node.classList.add('show'); setTimeout(()=>node.classList.remove('show'),2200); }
+  async function load() {
+    try { state.data=await api('/v1/routing'); render(); const health=await api('/health'); $('healthText').textContent=health.ok?'Node healthy':'Node attention'; $('healthDot').style.background=health.ok?'#77d69d':'#d86a3b'; }
+    catch (error) { toast(error.message); $('healthText').textContent='Control unavailable'; $('healthDot').style.background='#d86a3b'; }
+  }
+  function render() {
+    const data=state.data, local=data.localSpeakerId; $('localSpeakerHeading').textContent=local;
+    const body=$('matrixBody'); body.replaceChildren();
+    if (!data.streams.length) { body.innerHTML='<tr><td colspan="3" class="empty">Waiting for SAP streams...</td></tr>'; }
+    data.streams.forEach(stream=>{
+      const row=document.createElement('tr'); const routed=(data.routes[stream.id]||[]).includes(local);
+      row.innerHTML=`<td class="source">${esc(stream.sessionName)}<small>${esc(stream.id)}</small></td><td><input class="toggle" type="checkbox" ${routed?'checked':''} aria-label="Route ${esc(stream.sessionName)}"></td><td>${stream.channelCount} ch / ${stream.payloadType} / ${stream.destination}:${stream.destinationPort}</td>`;
+      row.querySelector('input').onchange=()=>route(stream.id, row.querySelector('input').checked); body.append(row);
+    });
+    renderDsp(local); renderGroups();
+  }
+  async function route(streamId, selected) { const routes={...(state.data.routes||{})}; routes[streamId]=selected?[state.data.localSpeakerId]:[]; try { state.data=await api('/v1/routes',json('PUT',{streamId,speakerIds:routes[streamId]})); render(); toast(selected?'Route connected':'Route disconnected'); } catch(error){ toast(error.message); load(); } }
+  function renderDsp(speakerId) {
+    $('selectedSpeaker').textContent=speakerId; const dsp=state.data.dsp[speakerId]||{gainDb:0,delayMs:0,eq:[]};
+    $('dspForm').innerHTML=`<div class="field-row"><label>Gain (dB)<input id="gain" type="number" min="-60" max="12" step="0.1" value="${dsp.gainDb}"></label><label>Delay (ms)<input id="delay" type="number" min="0" max="500" step="0.1" value="${dsp.delayMs}"></label></div><div class="bands" id="bands"></div><button class="secondary" id="addBand" type="button">Add EQ band</button> <button id="saveDsp">Save DSP</button>`;
+    const bands=$('bands'); (dsp.eq||[]).forEach((band,index)=>addBand(bands,band,index)); $('saveDsp').onclick=async()=>{ const eq=[...bands.children].map(row=>({frequencyHz:Number(row.querySelector('.freq').value),gainDb:Number(row.querySelector('.eqgain').value),q:Number(row.querySelector('.q').value)})); try { await api(`/v1/speakers/${encodeURIComponent(speakerId)}/dsp`,json('PUT',{gainDb:Number($('gain').value),delayMs:Number($('delay').value),eq})); toast('DSP saved'); } catch(error){ toast(error.message); } };
+    $('addBand').onclick=()=>addBand(bands);
+  }
+  function addBand(container, band={frequencyHz:1000,gainDb:0,q:1}, index) { const row=document.createElement('div'); row.className='band'; row.innerHTML=`<label>Hz<input class="freq" type="number" value="${band.frequencyHz}"></label><label>dB<input class="eqgain" type="number" value="${band.gainDb}"></label><label>Q<input class="q" type="number" value="${band.q}"></label><button class="warn" type="button">×</button>`; row.querySelector('button').onclick=()=>row.remove(); $('bands').append(row); }
+  function renderGroups() { const node=$('groups'); node.replaceChildren(); if(!state.data.groups.length) node.innerHTML='<p class="empty">No groups yet.</p>'; state.data.groups.forEach(group=>{ const row=document.createElement('div'); row.className='group'; row.innerHTML=`<span><strong>${esc(group.name)}</strong><small>${group.speakerIds.length} speakers</small></span><button class="warn">Delete</button>`; row.querySelector('button').onclick=async()=>{await api(`/v1/groups/${encodeURIComponent(group.id)}`,{method:'DELETE'}); load();}; node.append(row); }); }
+  $('addGroup').onclick=async()=>{ const name=prompt('Group name'); if(!name) return; const id=name.toLowerCase().replace(/[^a-z0-9]+/g,'-'); await api(`/v1/groups/${id}`,json('PUT',{id,name,speakerIds:[state.data.localSpeakerId]})); load(); };
+  $('refresh').onclick=load; function esc(value){return String(value).replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));}
+  load(); setInterval(load,5000);
+</script>
+</body>
+</html>

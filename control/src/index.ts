@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
 import { connect as connectSocket } from "node:net";
 import { resolve } from "node:path";
 import type { Duplex } from "node:stream";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { SapRegistry, type DiscoveryPublisher, type DiscoveryRegistry } from "./discovery.js";
+
+const webUiPath = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../public/index.html");
 
 export interface NodeConfig {
   nodeId: string;
@@ -30,6 +33,30 @@ export interface NodeStatus {
     ptpLocked: boolean;
     streamRunning: boolean;
   };
+}
+
+export interface EqBand {
+  frequencyHz: number;
+  gainDb: number;
+  q: number;
+}
+
+export interface DspProfile {
+  gainDb: number;
+  delayMs: number;
+  eq: EqBand[];
+}
+
+export interface SpeakerGroup {
+  id: string;
+  name: string;
+  speakerIds: string[];
+}
+
+export interface RoutingState {
+  groups: SpeakerGroup[];
+  dsp: Record<string, DspProfile>;
+  routes: Record<string, string[]>;
 }
 
 export const defaultConfig: NodeConfig = {
@@ -131,8 +158,9 @@ export function createControlServer(initialConfig: NodeConfig = defaultConfig,
     health: { ok: true, ptpLocked: false, streamRunning: false },
   };
   const websocket = new WebSocketHub(status, runtime, discovery);
+  const routing: RoutingState = { groups: [], dsp: {}, routes: {} };
   const server = createServer((request, response) =>
-    handleRequest(request, response, status, websocket, runtime, discovery, registry));
+    handleRequest(request, response, status, websocket, runtime, discovery, registry, routing));
   server.on("upgrade", (request, socket) => websocket.accept(request, socket));
   server.on("close", () => { websocket.close(); discovery.close(); registry.close(); });
   void registry.start().catch(() => undefined);
@@ -150,21 +178,33 @@ function snapshot(status: NodeStatus): NodeStatus {
 
 function handleRequest(request: IncomingMessage, response: ServerResponse, status: NodeStatus,
                        websocket: WebSocketHub, runtime: SpeakerRuntime,
-                       discovery: DiscoveryPublisher, registry: DiscoveryRegistry): void {
+                       discovery: DiscoveryPublisher, registry: DiscoveryRegistry,
+                       routing: RoutingState): void {
+  const path = request.url?.split("?", 1)[0] ?? "/";
+  if (request.method === "GET" && path === "/") {
+    response.statusCode = 200;
+    response.setHeader("content-type", "text/html; charset=utf-8");
+    response.end(readFileSync(webUiPath, "utf8"));
+    return;
+  }
   response.setHeader("content-type", "application/json");
-  if (request.method === "GET" && request.url === "/health") {
+  if (request.method === "GET" && path === "/health") {
     send(response, 200, status.health);
     return;
   }
-  if (request.method === "GET" && request.url === "/v1/status") {
+  if (request.method === "GET" && path === "/v1/status") {
     send(response, 200, snapshot(status));
     return;
   }
-  if (request.method === "GET" && request.url === "/v1/discovery/streams") {
+  if (request.method === "GET" && path === "/v1/discovery/streams") {
     send(response, 200, { streams: registry.list() });
     return;
   }
-  if (request.method === "PUT" && request.url === "/v1/config") {
+  if (request.method === "GET" && path === "/v1/routing") {
+    send(response, 200, { ...routing, streams: registry.list(), localSpeakerId: status.config.nodeId });
+    return;
+  }
+  if (request.method === "PUT" && path === "/v1/config") {
     collectJson(request, (body) => {
       if (!isNodeConfig(body)) {
         send(response, 400, { error: "invalid node configuration" });
@@ -176,7 +216,7 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     });
     return;
   }
-  if (request.method === "POST" && request.url === "/v1/subscribe") {
+  if (request.method === "POST" && path === "/v1/subscribe") {
     collectJson(request, (body) => {
       if (body !== undefined && !isSubscriptionRequest(body)) {
         send(response, 400, { error: "invalid subscription" });
@@ -199,7 +239,7 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     });
     return;
   }
-  if (request.method === "POST" && request.url === "/v1/routes") {
+  if (request.method === "POST" && path === "/v1/routes") {
     collectJson(request, (body) => {
       const streamId = isRouteRequest(body) ? body.streamId : undefined;
       const stream = streamId === undefined ? undefined : registry.get(streamId);
@@ -221,7 +261,67 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     });
     return;
   }
-  if (request.method === "POST" && request.url === "/v1/unsubscribe") {
+  if (request.method === "PUT" && path === "/v1/routes") {
+    collectJson(request, (body) => {
+      if (!isRouteMatrix(body)) {
+        send(response, 400, { error: "routes must map a streamId to speakerIds" });
+        return;
+      }
+      routing.routes[body.streamId] = body.speakerIds;
+      const localSpeakerId = status.config.nodeId;
+      const stream = registry.get(body.streamId);
+      const localSelected = body.speakerIds.includes(localSpeakerId);
+      const operation = localSelected && stream !== undefined
+        ? runtime.subscribe({ ...status.config, destination: stream.destination,
+          destinationPort: stream.destinationPort, channelCount: stream.channelCount })
+        : runtime.unsubscribe();
+      void operation.then(() => {
+        status.subscription.active = localSelected;
+        status.stream = localSelected ? "running" : "stopped";
+        status.health.streamRunning = localSelected;
+        send(response, 200, { ...routing, streams: registry.list(), localSpeakerId });
+        websocket.broadcast(status);
+      }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
+    });
+    return;
+  }
+  if (request.method === "PUT" && path.match(/^\/v1\/groups\/[^/]+$/)) {
+    const id = path.split("/").pop()!;
+    collectJson(request, (body) => {
+      if (!isSpeakerGroup(body) || body.id !== id) {
+        send(response, 400, { error: "invalid speaker group" });
+        return;
+      }
+      routing.groups = [...routing.groups.filter((group) => group.id !== id), body];
+      send(response, 200, body);
+      websocket.broadcast(status);
+    });
+    return;
+  }
+  if (request.method === "DELETE" && path.match(/^\/v1\/groups\/[^/]+$/)) {
+    const id = path.split("/").pop()!;
+    routing.groups = routing.groups.filter((group) => group.id !== id);
+    send(response, 200, { groups: routing.groups });
+    websocket.broadcast(status);
+    return;
+  }
+  if (request.method === "PUT" && path.match(/^\/v1\/speakers\/[^/]+\/dsp$/)) {
+    const speakerId = path.split("/")[3];
+    collectJson(request, (body) => {
+      if (!isDspProfile(body)) {
+        send(response, 400, { error: "invalid DSP profile" });
+        return;
+      }
+      void (speakerId === status.config.nodeId ? runtime.setVolume(Math.pow(10, body.gainDb / 20)) : Promise.resolve())
+        .then(() => {
+          routing.dsp[speakerId] = body;
+          send(response, 200, body);
+          websocket.broadcast(status);
+        }).catch((error: unknown) => send(response, 409, { error: errorMessage(error) }));
+    });
+    return;
+  }
+  if (request.method === "POST" && path === "/v1/unsubscribe") {
     void runtime.unsubscribe().then(() => discovery.withdraw()).then(() => {
       status.subscription.active = false;
       status.stream = "stopped";
@@ -231,11 +331,11 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
     return;
   }
-  if (request.method === "GET" && request.url === "/v1/volume") {
+  if (request.method === "GET" && path === "/v1/volume") {
     send(response, 200, { volume: status.volume });
     return;
   }
-  if (request.method === "PUT" && request.url === "/v1/volume") {
+  if (request.method === "PUT" && path === "/v1/volume") {
     collectJson(request, (body) => {
       if (!isVolumeRequest(body)) {
         send(response, 400, { error: "volume must be a number from 0 to 1" });
@@ -286,6 +386,33 @@ function isVolumeRequest(value: unknown): value is { volume: number } {
 
 function isRouteRequest(value: unknown): value is { streamId: string } {
   return typeof value === "object" && value !== null && typeof (value as Record<string, unknown>).streamId === "string";
+}
+
+function isRouteMatrix(value: unknown): value is { streamId: string; speakerIds: string[] } {
+  if (!isRouteRequest(value)) return false;
+  const speakerIds = (value as Record<string, unknown>).speakerIds;
+  return Array.isArray(speakerIds) && speakerIds.every((speaker: unknown) => typeof speaker === "string");
+}
+
+function isSpeakerGroup(value: unknown): value is SpeakerGroup {
+  if (typeof value !== "object" || value === null) return false;
+  const group = value as Record<string, unknown>;
+  return typeof group.id === "string" && group.id.length > 0 && typeof group.name === "string" &&
+    Array.isArray(group.speakerIds) && group.speakerIds.every((speaker) => typeof speaker === "string");
+}
+
+function isDspProfile(value: unknown): value is DspProfile {
+  if (typeof value !== "object" || value === null) return false;
+  const dsp = value as Record<string, unknown>;
+  return typeof dsp.gainDb === "number" && Number.isFinite(dsp.gainDb) && dsp.gainDb >= -60 && dsp.gainDb <= 12 &&
+    typeof dsp.delayMs === "number" && Number.isFinite(dsp.delayMs) && dsp.delayMs >= 0 && dsp.delayMs <= 500 &&
+    Array.isArray(dsp.eq) && dsp.eq.every((band) => {
+      if (typeof band !== "object" || band === null) return false;
+      const eq = band as Record<string, unknown>;
+      return typeof eq.frequencyHz === "number" && eq.frequencyHz > 0 && eq.frequencyHz <= 24000 &&
+        typeof eq.gainDb === "number" && eq.gainDb >= -24 && eq.gainDb <= 24 &&
+        typeof eq.q === "number" && eq.q > 0 && eq.q <= 20;
+    });
 }
 
 function isMulticast(address: string): boolean {
