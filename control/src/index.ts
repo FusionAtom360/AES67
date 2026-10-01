@@ -12,18 +12,22 @@ const webUiPath = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../p
 const maxRequestBytes = 1 << 20;
 const maxWebSocketPayload = 1 << 20;
 
+export type NodeRole = "sender" | "receiver";
+
 export interface NodeConfig {
   nodeId: string;
   channelCount: number;
   payloadType: number;
   destination: string;
   destinationPort: number;
+  role?: NodeRole;
 }
 
 export interface NodeStatus {
   profile: "AES67-L24-48k-1ms";
   ptp: "locked" | "unlocked";
   stream: "stopped" | "running";
+  role: NodeRole;
   config: NodeConfig;
   subscription: {
     active: boolean;
@@ -69,6 +73,7 @@ export const defaultConfig: NodeConfig = {
   payloadType: 96,
   destination: "239.69.0.1",
   destinationPort: 5004,
+  role: "receiver",
 };
 
 interface PersistedState {
@@ -81,7 +86,7 @@ class StateStore {
   public constructor(private readonly path: string | undefined) {}
 
   public load(initialConfig: NodeConfig): PersistedState {
-    const fallback = { config: { ...initialConfig }, routing: { groups: [], dsp: {}, routes: {} }, volume: 1 };
+    const fallback = { config: { ...initialConfig, role: initialConfig.role ?? "receiver" }, routing: { groups: [], dsp: {}, routes: {} }, volume: 1 };
     if (this.path === undefined) return fallback;
     try {
       const stored = JSON.parse(readFileSync(this.path, "utf8")) as Partial<PersistedState>;
@@ -125,6 +130,10 @@ export interface SpeakerRuntime {
   subscribe(config: NodeConfig): Promise<void>;
   unsubscribe(): Promise<void>;
   setVolume(volume: number): Promise<void>;
+  startSender?(config: NodeConfig): Promise<void>;
+  stopSender?(): Promise<void>;
+  setRole?(role: NodeRole, config: NodeConfig): Promise<void>;
+  getRole?(): NodeRole;
   isRunning(): boolean;
   onStateChange?(listener: () => void): () => void;
 }
@@ -132,10 +141,12 @@ export interface SpeakerRuntime {
 export class ProcessSpeakerRuntime implements SpeakerRuntime {
   private child: ChildProcess | undefined;
   private socketPath: string | undefined;
+  private role: NodeRole = "receiver";
   private readonly stateListeners = new Set<() => void>();
 
   public async subscribe(config: NodeConfig): Promise<void> {
-    await this.unsubscribe();
+    this.role = config.role ?? "receiver";
+    await this.stopChild();
     const executable = process.env.AES67_SPEAKER_EXECUTABLE ?? resolve(process.cwd(), "../build/aes67_speaker_node");
     const socketName = config.nodeId.replace(/[^a-zA-Z0-9_.-]/g, "_");
     this.socketPath = process.env.AES67_CONTROL_SOCKET ?? `/tmp/aes67-${socketName}.sock`;
@@ -165,7 +176,56 @@ export class ProcessSpeakerRuntime implements SpeakerRuntime {
     });
   }
 
+  public async startSender(config: NodeConfig): Promise<void> {
+    this.role = "sender";
+    await this.stopChild();
+    const executable = process.env.AES67_SENDER_EXECUTABLE ?? resolve(process.cwd(), "../build/aes67_sender_node");
+    const args = ["--device", process.env.AES67_ALSA_DEVICE ?? "default",
+      "--destination", config.destination, "--port", String(config.destinationPort)];
+    if (process.env.AES67_STREAM_SDP) args.push("--sdp", process.env.AES67_STREAM_SDP);
+    const child = spawn(executable, args, { stdio: "ignore" });
+    this.child = child;
+    child.once("exit", () => {
+      if (this.child === child) this.child = undefined;
+      console.error(`sender process exited: code=${child.exitCode ?? "none"} signal=${child.signalCode ?? "none"}`);
+      this.notifyStateChange();
+    });
+    await new Promise<void>((resolvePromise, reject) => {
+      const onError = (error: Error) => {
+        if (this.child === child) this.child = undefined;
+        this.notifyStateChange();
+        reject(error);
+      };
+      child.once("error", onError);
+      child.once("spawn", () => {
+        child.off("error", onError);
+        resolvePromise();
+      });
+    });
+  }
+
+  public async stopSender(): Promise<void> {
+    await this.stopChild();
+  }
+
+  public async setRole(role: NodeRole, config: NodeConfig): Promise<void> {
+    this.role = role;
+    if (role === "sender") {
+      await this.startSender(config);
+      return;
+    }
+    await this.subscribe(config);
+  }
+
+  public getRole(): NodeRole {
+    return this.role;
+  }
+
   public async unsubscribe(): Promise<void> {
+    await this.stopChild();
+  }
+
+  private async stopChild(): Promise<void> {
     const child = this.child;
     if (child === undefined) return;
     this.child = undefined;
@@ -219,11 +279,13 @@ export function createControlServer(initialConfig: NodeConfig = defaultConfig,
                                     registry: DiscoveryRegistry = new SapRegistry()): Server {
   const stateStore = new StateStore(process.env.AES67_STATE_FILE);
   const persisted = stateStore.load(initialConfig);
+  const role = persisted.config.role ?? "receiver";
   const status: NodeStatus = {
     profile: "AES67-L24-48k-1ms",
     ptp: "unlocked",
     stream: "stopped",
-    config: { ...persisted.config },
+    role,
+    config: { ...persisted.config, role },
     subscription: {
       active: false,
       destination: persisted.config.destination,
@@ -278,17 +340,40 @@ function snapshot(status: NodeStatus): NodeStatus {
 async function activateSubscription(config: NodeConfig, status: NodeStatus,
                                     runtime: SpeakerRuntime, discovery: DiscoveryPublisher): Promise<void> {
   const previousConfig = { ...status.config };
+  const previousRole = status.role;
   const wasActive = status.subscription.active;
+  const targetRole = config.role ?? previousRole;
   try {
-    await runtime.subscribe(config);
+    if (runtime.setRole !== undefined) {
+      await runtime.setRole(targetRole, config);
+    } else if (targetRole === "sender") {
+      if (runtime.startSender !== undefined) {
+        await runtime.startSender(config);
+      } else {
+        await runtime.subscribe(config);
+      }
+    } else {
+      await runtime.subscribe(config);
+    }
     await discovery.publish(config);
   } catch (error: unknown) {
     try {
       if (wasActive) {
-        await runtime.subscribe(previousConfig);
+        if (runtime.setRole !== undefined) {
+          await runtime.setRole(previousRole, previousConfig);
+        } else if (previousRole === "sender") {
+          if (runtime.startSender !== undefined) {
+            await runtime.startSender(previousConfig);
+          } else {
+            await runtime.subscribe(previousConfig);
+          }
+        } else {
+          await runtime.subscribe(previousConfig);
+        }
         await discovery.publish(previousConfig);
       } else {
         await runtime.unsubscribe();
+        if (runtime.stopSender !== undefined) await runtime.stopSender();
         await discovery.withdraw();
       }
     } catch {
@@ -296,6 +381,8 @@ async function activateSubscription(config: NodeConfig, status: NodeStatus,
     }
     throw error;
   }
+  status.role = targetRole;
+  status.config = { ...config, role: targetRole };
   status.subscription = {
     active: true,
     destination: config.destination,
@@ -311,7 +398,11 @@ async function deactivateSubscription(status: NodeStatus, runtime: SpeakerRuntim
   const previousConfig = { ...status.config };
   await discovery.withdraw();
   try {
-    await runtime.unsubscribe();
+    if (status.role === "sender" && runtime.stopSender !== undefined) {
+      await runtime.stopSender();
+    } else {
+      await runtime.unsubscribe();
+    }
   } catch (error: unknown) {
     try {
       if (status.subscription.active) await discovery.publish(previousConfig);
@@ -323,6 +414,32 @@ async function deactivateSubscription(status: NodeStatus, runtime: SpeakerRuntim
   status.subscription.active = false;
   status.stream = "stopped";
   status.health.streamRunning = false;
+  status.health.ok = status.health.discoveryAvailable;
+}
+
+async function setNodeMode(mode: NodeRole, status: NodeStatus,
+                          runtime: SpeakerRuntime, discovery: DiscoveryPublisher): Promise<void> {
+  const proposed = { ...status.config, role: mode };
+  status.role = mode;
+  status.config = proposed;
+  if (status.subscription.active) {
+    await activateSubscription(proposed, status, runtime, discovery);
+    return;
+  }
+  if (runtime.setRole !== undefined) {
+    await runtime.setRole(mode, proposed);
+  } else if (mode === "sender") {
+    if (runtime.startSender !== undefined) {
+      await runtime.startSender(proposed);
+    } else {
+      await runtime.subscribe(proposed);
+    }
+  } else {
+    await runtime.subscribe(proposed);
+  }
+  status.subscription = { active: true, destination: proposed.destination, destinationPort: proposed.destinationPort };
+  status.stream = "running";
+  status.health.streamRunning = true;
   status.health.ok = status.health.discoveryAvailable;
 }
 
@@ -361,12 +478,29 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
         return;
       }
       void mutations.run(async () => {
-        const proposed = { ...body };
+        const proposed = { ...body, role: body.role ?? status.role };
         if (status.subscription.active) {
           await activateSubscription(proposed, status, runtime, discovery);
         }
         status.config = proposed;
-        send(response, 200, status.config);
+        status.role = proposed.role ?? status.role;
+        send(response, 200, { ...status.config, role: status.role });
+        websocket.broadcast(status);
+      }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
+    });
+    return;
+  }
+  if ((request.method === "PUT" || request.method === "POST") && (path === "/v1/mode" || path === "/v1/role")) {
+    collectJson(request, response, (body) => {
+      if (!isNodeRole((body as Record<string, unknown>)?.role)) {
+        send(response, 400, { error: "role must be sender or receiver" });
+        return;
+      }
+      void mutations.run(async () => {
+        const mode = (body as { role: NodeRole }).role;
+        await setNodeMode(mode, status, runtime, discovery);
+        status.config = { ...status.config, role: mode };
+        send(response, 200, { role: status.role, config: status.config });
         websocket.broadcast(status);
       }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
     });
@@ -539,6 +673,10 @@ function collectJson(request: IncomingMessage, response: ServerResponse,
   });
 }
 
+function isNodeRole(value: unknown): value is NodeRole {
+  return value === "sender" || value === "receiver";
+}
+
 function isNodeConfig(value: unknown): value is NodeConfig {
   if (typeof value !== "object" || value === null) return false;
   const config = value as Record<string, unknown>;
@@ -547,7 +685,8 @@ function isNodeConfig(value: unknown): value is NodeConfig {
     typeof config.payloadType === "number" && Number.isInteger(config.payloadType) &&
     config.payloadType >= 96 && config.payloadType <= 127 &&
     isDestination(config.destination) && typeof config.destinationPort === "number" &&
-    Number.isInteger(config.destinationPort) && config.destinationPort > 0 && config.destinationPort < 65536;
+    Number.isInteger(config.destinationPort) && config.destinationPort > 0 && config.destinationPort < 65536 &&
+    (config.role === undefined || isNodeRole(config.role));
 }
 
 function isRoutingState(value: unknown): value is RoutingState {
@@ -741,34 +880,48 @@ class WebSocketHub {
 
   private async handleCommand(socket: Duplex, text: string): Promise<void> {
     try {
-      const command = JSON.parse(text) as { action?: string; destination?: string; destinationPort?: number; volume?: number };
-      if (command.action === "status") {
+      const command = JSON.parse(text) as Record<string, unknown>;
+      const action = typeof command.action === "string" ? command.action : undefined;
+      const destination = typeof command.destination === "string" ? command.destination : undefined;
+      const destinationPort = typeof command.destinationPort === "number" ? command.destinationPort : undefined;
+      const volume = typeof command.volume === "number" ? command.volume : undefined;
+      const roleValue = command.role;
+      const role = isNodeRole(roleValue) ? roleValue : undefined;
+      if (action === "status") {
         this.send(socket, { type: "status", data: snapshot(this.status) });
         return;
       }
-      if (command.action === "subscribe" && !isSubscriptionRequest(command)) {
+      if (action === "subscribe" && !isSubscriptionRequest(command)) {
         this.send(socket, { type: "error", error: "invalid subscription" });
         return;
       }
-      if (command.action === "setVolume" && !isVolumeRequest(command)) {
+      if (action === "setVolume" && !isVolumeRequest(command)) {
         this.send(socket, { type: "error", error: "volume must be a number from 0 to 1" });
         return;
       }
+      if ((action === "setMode" || action === "setRole") && role === undefined) {
+        this.send(socket, { type: "error", error: "role must be sender or receiver" });
+        return;
+      }
       await this.mutations.run(async () => {
-        if (command.action === "subscribe") {
+        if (action === "subscribe") {
           const proposed = { ...this.status.config,
-            ...(command.destination === undefined ? {} : { destination: command.destination }),
-            ...(command.destinationPort === undefined ? {} : { destinationPort: command.destinationPort }),
+            ...(destination === undefined ? {} : { destination }),
+            ...(destinationPort === undefined ? {} : { destinationPort }),
           };
           await activateSubscription(proposed, this.status, this.runtime, this.discovery);
           this.status.config = proposed;
           this.broadcast(this.status);
-        } else if (command.action === "unsubscribe") {
+        } else if (action === "unsubscribe") {
           await deactivateSubscription(this.status, this.runtime, this.discovery);
           this.broadcast(this.status);
-        } else if (command.action === "setVolume") {
-          await this.runtime.setVolume(command.volume!);
-          this.status.volume = command.volume!;
+        } else if (action === "setMode" || action === "setRole") {
+          await setNodeMode(role!, this.status, this.runtime, this.discovery);
+          this.status.config = { ...this.status.config, role: role! };
+          this.broadcast(this.status);
+        } else if (action === "setVolume") {
+          await this.runtime.setVolume(volume!);
+          this.status.volume = volume!;
           this.broadcast(this.status);
         } else {
           this.send(socket, { type: "error", error: "invalid WebSocket command" });

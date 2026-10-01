@@ -10,11 +10,18 @@ class FakeRuntime implements SpeakerRuntime {
   public running = false;
   public volume = 1;
   public lastConfig: NodeConfig | undefined;
+  public role: "sender" | "receiver" = "receiver";
   private readonly listeners = new Set<() => void>();
 
-  public async subscribe(config: NodeConfig): Promise<void> { this.running = true; this.lastConfig = config; this.notify(); }
+  public async subscribe(config: NodeConfig): Promise<void> { this.running = true; this.role = config.role ?? "receiver"; this.lastConfig = config; this.notify(); }
   public async unsubscribe(): Promise<void> { this.running = false; this.notify(); }
   public async setVolume(volume: number): Promise<void> { this.volume = volume; }
+  public async startSender(config: NodeConfig): Promise<void> { this.running = true; this.role = "sender"; this.lastConfig = config; this.notify(); }
+  public async stopSender(): Promise<void> { this.running = false; this.notify(); }
+  public async setRole(role: "sender" | "receiver", config: NodeConfig): Promise<void> {
+    this.role = role; this.running = true; this.lastConfig = config; this.notify();
+  }
+  public getRole(): "sender" | "receiver" { return this.role; }
   public isRunning(): boolean { return this.running; }
   public onStateChange(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -47,6 +54,43 @@ class FakeRegistry implements DiscoveryRegistry {
   public list(): DiscoveredStream[] { return [this.stream]; }
   public get(id: string): DiscoveredStream | undefined { return id === this.stream.id ? this.stream : undefined; }
 }
+
+test("role-aware control can switch a node between sender and receiver modes", async () => {
+  const runtime = new FakeRuntime();
+  const discovery = new FakeDiscovery();
+  const registry = new FakeRegistry();
+  const server = createControlServer({
+    nodeId: "node-1",
+    channelCount: 2,
+    payloadType: 96,
+    destination: "239.69.0.1",
+    destinationPort: 5004,
+    role: "receiver",
+  }, runtime, discovery, registry);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+
+  const modeSet = await call(address.port, "PUT", "/v1/mode", { role: "sender" });
+  assert.equal(modeSet.statusCode, 200);
+  assert.equal((modeSet.body as { role: string }).role, "sender");
+  const status = await call(address.port, "GET", "/v1/status");
+  assert.equal((status.body as { role: string }).role, "sender");
+
+  const configSet = await call(address.port, "PUT", "/v1/config", {
+    nodeId: "node-1",
+    channelCount: 2,
+    payloadType: 96,
+    destination: "239.69.0.2",
+    destinationPort: 5005,
+    role: "receiver",
+  });
+  assert.equal(configSet.statusCode, 200);
+  assert.equal((configSet.body as { role: string }).role, "receiver");
+
+  await closeServer(server);
+});
 
 test("control plane reports the pinned profile and accepts configuration", async () => {
   const runtime = new FakeRuntime();

@@ -2,6 +2,4 @@ build/
 control/node_modules/
 control/dist/
 .vscode/*.log
-TECHNICAL_REVIEW.md
-TECHNICAL_REVIEW_2.md
-installation.md
+dev/
