@@ -51,6 +51,11 @@ The control daemon exposes:
 - `GET /v1/volume` and `PUT /v1/volume` with `{ "volume": 0.0..1.0 }`
 - WebSocket `GET /v1/events` for status events and `subscribe`, `unsubscribe`, `setVolume`, and `status` commands
 
+When a stream is subscribed, the control daemon publishes its SDP through SAP on
+`224.2.127.254:9875` and repeats the announcement every 30 seconds. Unsubscribing stops the announcements.
+The publisher is isolated behind a `DiscoveryPublisher` interface so the SAP implementation can be replaced by
+an NMOS IS-04 registry/query client and IS-05 connection manager without changing the control API.
+
 When started from `control`, the daemon launches `../build/aes67_speaker_node` for subscriptions. Set `AES67_SPEAKER_EXECUTABLE` to override the executable path and `AES67_ALSA_DEVICE` to select the playback device. For example:
 
 ```sh

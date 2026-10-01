@@ -5,6 +5,7 @@ import { connect as connectSocket } from "node:net";
 import { resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { pathToFileURL } from "node:url";
+import { SapRegistry, type DiscoveryPublisher, type DiscoveryRegistry } from "./discovery.js";
 
 export interface NodeConfig {
   nodeId: string;
@@ -113,7 +114,9 @@ export class ProcessSpeakerRuntime implements SpeakerRuntime {
 }
 
 export function createControlServer(initialConfig: NodeConfig = defaultConfig,
-                                    runtime: SpeakerRuntime = new ProcessSpeakerRuntime()): Server {
+                                    runtime: SpeakerRuntime = new ProcessSpeakerRuntime(),
+                                    discovery: DiscoveryPublisher = new NoopDiscoveryPublisher(),
+                                    registry: DiscoveryRegistry = new SapRegistry()): Server {
   const status: NodeStatus = {
     profile: "AES67-L24-48k-1ms",
     ptp: "unlocked",
@@ -127,10 +130,12 @@ export function createControlServer(initialConfig: NodeConfig = defaultConfig,
     volume: 1,
     health: { ok: true, ptpLocked: false, streamRunning: false },
   };
-  const websocket = new WebSocketHub(status, runtime);
-  const server = createServer((request, response) => handleRequest(request, response, status, websocket, runtime));
+  const websocket = new WebSocketHub(status, runtime, discovery);
+  const server = createServer((request, response) =>
+    handleRequest(request, response, status, websocket, runtime, discovery, registry));
   server.on("upgrade", (request, socket) => websocket.accept(request, socket));
-  server.on("close", () => websocket.close());
+  server.on("close", () => { websocket.close(); discovery.close(); registry.close(); });
+  void registry.start().catch(() => undefined);
   return server;
 }
 
@@ -144,7 +149,8 @@ function snapshot(status: NodeStatus): NodeStatus {
 }
 
 function handleRequest(request: IncomingMessage, response: ServerResponse, status: NodeStatus,
-                       websocket: WebSocketHub, runtime: SpeakerRuntime): void {
+                       websocket: WebSocketHub, runtime: SpeakerRuntime,
+                       discovery: DiscoveryPublisher, registry: DiscoveryRegistry): void {
   response.setHeader("content-type", "application/json");
   if (request.method === "GET" && request.url === "/health") {
     send(response, 200, status.health);
@@ -152,6 +158,10 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
   }
   if (request.method === "GET" && request.url === "/v1/status") {
     send(response, 200, snapshot(status));
+    return;
+  }
+  if (request.method === "GET" && request.url === "/v1/discovery/streams") {
+    send(response, 200, { streams: registry.list() });
     return;
   }
   if (request.method === "PUT" && request.url === "/v1/config") {
@@ -175,7 +185,7 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
       const subscription = body as Partial<NodeConfig> | undefined;
       if (subscription?.destination !== undefined) status.config.destination = subscription.destination;
       if (subscription?.destinationPort !== undefined) status.config.destinationPort = subscription.destinationPort;
-      void runtime.subscribe(status.config).then(() => {
+      void runtime.subscribe(status.config).then(() => discovery.publish(status.config)).then(() => {
         status.subscription = {
           active: true,
           destination: status.config.destination,
@@ -189,8 +199,30 @@ function handleRequest(request: IncomingMessage, response: ServerResponse, statu
     });
     return;
   }
+  if (request.method === "POST" && request.url === "/v1/routes") {
+    collectJson(request, (body) => {
+      const streamId = isRouteRequest(body) ? body.streamId : undefined;
+      const stream = streamId === undefined ? undefined : registry.get(streamId);
+      if (stream === undefined) {
+        send(response, 404, { error: "discovered stream not found" });
+        return;
+      }
+      const routedConfig = { ...status.config, destination: stream.destination,
+        destinationPort: stream.destinationPort, channelCount: stream.channelCount };
+      void runtime.subscribe(routedConfig).then(() => {
+        status.config = routedConfig;
+        status.subscription = { active: true, destination: stream.destination,
+          destinationPort: stream.destinationPort };
+        status.stream = "running";
+        status.health.streamRunning = true;
+        send(response, 200, snapshot(status));
+        websocket.broadcast(status);
+      }).catch((error: unknown) => send(response, 502, { error: errorMessage(error) }));
+    });
+    return;
+  }
   if (request.method === "POST" && request.url === "/v1/unsubscribe") {
-    void runtime.unsubscribe().then(() => {
+    void runtime.unsubscribe().then(() => discovery.withdraw()).then(() => {
       status.subscription.active = false;
       status.stream = "stopped";
       status.health.streamRunning = false;
@@ -252,6 +284,10 @@ function isVolumeRequest(value: unknown): value is { volume: number } {
   return typeof volume === "number" && Number.isFinite(volume) && volume >= 0 && volume <= 1;
 }
 
+function isRouteRequest(value: unknown): value is { streamId: string } {
+  return typeof value === "object" && value !== null && typeof (value as Record<string, unknown>).streamId === "string";
+}
+
 function isMulticast(address: string): boolean {
   const firstOctet = Number(address.split(".", 1)[0]);
   return Number.isInteger(firstOctet) && firstOctet >= 224 && firstOctet <= 239;
@@ -259,6 +295,12 @@ function isMulticast(address: string): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "speaker runtime failed";
+}
+
+class NoopDiscoveryPublisher implements DiscoveryPublisher {
+  public async publish(_config: NodeConfig): Promise<void> {}
+  public async withdraw(): Promise<void> {}
+  public close(): void {}
 }
 
 function send(response: ServerResponse, statusCode: number, body: unknown): void {
@@ -270,7 +312,8 @@ class WebSocketHub {
   private readonly clients = new Set<Duplex>();
   private readonly buffers = new Map<Duplex, Buffer>();
 
-  public constructor(private readonly status: NodeStatus, private readonly runtime: SpeakerRuntime) {}
+  public constructor(private readonly status: NodeStatus, private readonly runtime: SpeakerRuntime,
+                     private readonly discovery: DiscoveryPublisher) {}
 
   public accept(request: IncomingMessage, socket: Duplex): void {
     if (request.url !== "/v1/events" || request.headers.upgrade?.toLowerCase() !== "websocket") {
@@ -349,6 +392,7 @@ class WebSocketHub {
         if (command.destination !== undefined) this.status.config.destination = command.destination;
         if (command.destinationPort !== undefined) this.status.config.destinationPort = command.destinationPort;
         await this.runtime.subscribe(this.status.config);
+        await this.discovery.publish(this.status.config);
         this.status.subscription = { active: true, destination: this.status.config.destination,
           destinationPort: this.status.config.destinationPort };
         this.status.stream = "running";
@@ -356,6 +400,7 @@ class WebSocketHub {
         this.broadcast(this.status);
       } else if (command.action === "unsubscribe") {
         await this.runtime.unsubscribe();
+        await this.discovery.withdraw();
         this.status.subscription.active = false;
         this.status.stream = "stopped";
         this.status.health.streamRunning = false;

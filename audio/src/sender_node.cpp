@@ -10,14 +10,61 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <vector>
 
 #ifndef _WIN32
+#include <arpa/inet.h>
 #include <csignal>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 namespace {
 
 std::atomic_bool running{true};
+
+class SapPublisher {
+public:
+    explicit SapPublisher(const std::string& sdp) {
+#ifndef _WIN32
+        socket_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (socket_ < 0) throw std::runtime_error("could not create SAP socket");
+        destination_.sin_family = AF_INET;
+        destination_.sin_port = htons(9875);
+        inet_pton(AF_INET, "224.2.127.254", &destination_.sin_addr);
+        std::vector<std::uint8_t> header(8);
+        header[0] = 0x20;
+        header[2] = 0xAE;
+        header[3] = 0x67;
+        packet_ = header;
+        const std::string content = std::string("application/sdp") + '\0' + sdp;
+        packet_.insert(packet_.end(), content.begin(), content.end());
+#else
+        (void)sdp;
+#endif
+    }
+
+    ~SapPublisher() {
+#ifndef _WIN32
+        if (socket_ >= 0) ::close(socket_);
+#endif
+    }
+
+    void announce() {
+#ifndef _WIN32
+        (void)::sendto(socket_, packet_.data(), packet_.size(), 0,
+                       reinterpret_cast<const sockaddr*>(&destination_), sizeof(destination_));
+#endif
+    }
+
+private:
+#ifndef _WIN32
+    int socket_ = -1;
+    sockaddr_in destination_{};
+    std::vector<std::uint8_t> packet_;
+#endif
+};
 
 void print_usage(const char* executable) {
     std::cout << "Usage: " << executable
@@ -90,10 +137,13 @@ int main(int argc, char** argv) {
         session.ptp_reference_clock = true;
         session.direct_media_clock = true;
         write_sdp(sdp_path, session);
+        SapPublisher sap(session.generate());
+        sap.announce();
 
         aes67::AlsaSource source(alsa_device);
         aes67::RtpSender sender({destination, port, interface_address, payload_type, true});
         aes67::PtpClock ptp_clock;
+        auto next_sap_announcement = ptp_clock.now_ns();
         auto rtp_timestamp = static_cast<std::uint32_t>(
             static_cast<std::uint64_t>(static_cast<long double>(ptp_clock.now_ns()) *
                                        aes67::AudioFormat::sample_rate / 1'000'000'000.0L));
@@ -102,6 +152,10 @@ int main(int argc, char** argv) {
         std::cout << "Publishing " << destination << ":" << port
                   << " as " << sdp_path << " from ALSA device " << alsa_device << "\n";
         while (running) {
+            if (ptp_clock.now_ns() >= next_sap_announcement) {
+                sap.announce();
+                next_sap_announcement = ptp_clock.now_ns() + 30'000'000'000ULL;
+            }
             auto packet = source.read_packet(rtp_timestamp);
             sender.send(packet, sequence_number++);
             rtp_timestamp += aes67::AudioFormat::samples_per_packet;
