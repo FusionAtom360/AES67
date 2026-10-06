@@ -138,6 +138,11 @@ int main() {
     playout.observe_packet(48'096, 900'000'000);
     assert(playout.due_time_ns(48'096, 900'000'000) == 920'000'000);
 
+    aes67::PlayoutController low_buffer_playout({48'000, 48, 20, 20});
+    assert(low_buffer_playout.output_samples(1) < 48);
+    aes67::PlayoutController high_buffer_playout({48'000, 100, 20, 20});
+    assert(high_buffer_playout.output_samples(40) > 100);
+
     aes67::PlayoutController absolute_playout({48'000, 48, 20, 20, true});
     absolute_playout.observe_packet(48'000, 1'000'000'000);
     assert(absolute_playout.due_time_ns(48'000, 1'000'000'000) == 1'020'000'000);

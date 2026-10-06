@@ -94,7 +94,9 @@ std::size_t PlayoutController::output_samples(std::size_t buffered_packets) {
                               static_cast<double>(config_.target_buffer_packets);
     // Positive queue error consumes the buffer faster; clock_ratio_ handles source drift.
     const auto queue_ratio = std::clamp(1.0 + queue_error * 0.001, 0.98, 1.02);
-    const auto desired = static_cast<double>(config_.packet_samples) / (clock_ratio_ * queue_ratio);
+    // A slow source or a low buffer must reduce consumption, not increase it.
+    // Multiplication provides negative feedback for both clock and queue drift.
+    const auto desired = static_cast<double>(config_.packet_samples) * clock_ratio_ * queue_ratio;
     const auto with_remainder = desired + frame_remainder_;
     const auto output = static_cast<std::size_t>(std::max(1.0, std::floor(with_remainder)));
     frame_remainder_ = with_remainder - static_cast<double>(output);
