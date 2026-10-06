@@ -100,6 +100,13 @@ int main() {
     assert(wrapped_buffer.pop_next().has_value());
     assert(wrapped_buffer.pop_next().has_value());
 
+    aes67::JitterBuffer gap_buffer;
+    gap_buffer.prime(48'000);
+    assert(gap_buffer.push(AudioPacket{format, 48'000, source.samples}));
+    assert(gap_buffer.push(AudioPacket{format, 48'096, source.samples}));
+    assert(gap_buffer.pop_next()->rtp_timestamp == 48'000);
+    assert(gap_buffer.pop_next()->rtp_timestamp == 48'096);
+
     aes67::ReceivePath malformed_path(format);
     auto malformed_datagram = first_datagram;
     malformed_datagram.resize(12 + 3);

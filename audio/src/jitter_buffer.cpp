@@ -40,7 +40,26 @@ std::optional<AudioPacket> JitterBuffer::pop_next() {
     if (!next_timestamp_.has_value()) {
         return std::nullopt;
     }
-    const auto packet = packets_.find(*next_timestamp_);
+    auto packet = packets_.find(*next_timestamp_);
+    if (packet == packets_.end() && !packets_.empty()) {
+        // Do not wait forever for a missing RTP packet. The caller only pops
+        // after the packet's playout deadline, so the earliest buffered future
+        // packet is the next playable item.
+        auto candidate = packets_.end();
+        std::uint32_t candidate_delta = 0;
+        for (auto current = packets_.begin(); current != packets_.end(); ++current) {
+            const auto delta = static_cast<std::uint32_t>(current->first - *next_timestamp_);
+            if (delta >= 0x8000'0000U) continue;
+            if (candidate == packets_.end() || delta < candidate_delta) {
+                candidate = current;
+                candidate_delta = delta;
+            }
+        }
+        if (candidate != packets_.end()) {
+            next_timestamp_ = candidate->first;
+            packet = candidate;
+        }
+    }
     if (packet == packets_.end()) {
         return std::nullopt;
     }
