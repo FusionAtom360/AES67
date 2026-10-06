@@ -203,10 +203,6 @@ int main(int argc, char** argv) {
         if (!sdp_path.empty() && manual_network_options) {
             throw std::invalid_argument("--sdp cannot be combined with manual network options");
         }
-        if (sdp_path.empty() && !first_timestamp.has_value()) {
-            first_timestamp = 0;
-        }
-
         std::optional<aes67::SdpSession> sdp;
         if (!sdp_path.empty()) {
             sdp = read_sdp(sdp_path);
