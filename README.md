@@ -11,6 +11,9 @@ Reference repository for a networked speaker node using a deliberately narrow AE
 
 The current implementation is a testable foundation, not a production network stack. It validates the audio payload representation and provides a small HTTP control API for node status and configuration. Transport sockets, PTP servo integration, device I/O, and security policy are intentionally explicit follow-up boundaries.
 
+### Note on LLM usage
+This is a self-directed learning project, so I wrote the code myself to make sure I understand every part of it. I used GitHub Copilot as an adversarial reviewer: it critiqued the implementation and the test suite and pointed out gaps. I implemented most of the resulting fixes myself. GitHub Copilot wrote the code for `audio_packet_test.cpp` and `sender_receiver_test.cpp`, which are marked in 690b0e516770a1834363d54895e08c9f66fa17fc and bb97ea3a51bdef584d4441e90adb9c3da33d77cd. I reviewed and can explain all of it.
+
 ## Layout
 
 ```text
